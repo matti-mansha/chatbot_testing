@@ -1,0 +1,5 @@
+streamlit
+notion-client
+openai
+python-dotenv
+playwright
