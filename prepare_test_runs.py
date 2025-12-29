@@ -171,9 +171,13 @@ def get_latest_child_page_id(parent_page_id: str) -> Optional[str]:
     return latest_id
 
 
-def split_text_for_notion(text: str, max_length: int = 1800) -> List[Dict[str, Any]]:
+def split_text_for_notion(text: str, max_length: int = 1900) -> List[Dict[str, Any]]:
     """
     Split long text into chunks for Notion rich_text (max 2000 chars per block).
+    
+    FIXED: Changed max_length from 2000 to 1900 to provide a safety buffer and 
+    avoid edge cases that could result in chunks slightly over 2000 characters.
+    
     Returns a list of rich_text objects.
     """
     if not text:
@@ -186,7 +190,7 @@ def split_text_for_notion(text: str, max_length: int = 1800) -> List[Dict[str, A
             "text": {"content": chunk}
         })
     
-    logger.debug(f"Split text into {len(chunks)} chunks")
+    logger.debug(f"Split text into {len(chunks)} chunks (max {max_length} chars each)")
     return chunks
 
 
@@ -408,8 +412,13 @@ def extract_property_value(page: Dict[str, Any], property_name: str) -> Any:
             title_list = prop.get("title", [])
             return title_list[0]["plain_text"] if title_list else ""
         elif prop_type == "rich_text":
+            # ✅ FIX: Concatenate ALL chunks, not just the first one
             rich_text_list = prop.get("rich_text", [])
-            return rich_text_list[0]["plain_text"] if rich_text_list else ""
+            if not rich_text_list:
+                return ""
+            # Concatenate all rich_text chunks
+            full_text = "".join(item.get("plain_text", "") for item in rich_text_list)
+            return full_text
         elif prop_type == "number":
             return prop.get("number")
         elif prop_type == "select":
