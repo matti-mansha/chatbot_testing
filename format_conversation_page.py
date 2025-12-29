@@ -74,7 +74,7 @@ def parse_conversation_transcript(text: str) -> Dict[str, Any]:
                 message_text = '\n'.join(current_message_lines).strip()
                 score = None
                 
-                # Extract completeness score if present (format: "🟢 **Completeness: 85/100**")
+                # Extract completeness score if present (format: "🟢 **Completeness: 90/100**")
                 score_match = re.search(r'[🟢🟡🟠🔴]\s*\*\*Completeness:\s*(\d+)/100\*\*', message_text)
                 if score_match:
                     score = int(score_match.group(1))

@@ -748,7 +748,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 logger.info(f"🧪 Tester reply with score {score}/100, should_continue={should_continue}")
                 
                 # ✅ CHECK FOR EARLY EXIT CONDITIONS
-                # Condition 1: High score (>= 85)
+                # Condition 1: High score (>= 90)
                 if score >= 90:
                     logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 90")
                     early_exit = True
