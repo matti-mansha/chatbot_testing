@@ -3,9 +3,13 @@
 Headless version of the Playwright bridge.
 Uses HTTP API instead of Streamlit for the tester bot.
 
-MODIFICATIONS:
+IMPROVEMENTS:
 - Tracks number of turns
 - Breaks loop early if completeness score >= 90
+- Retry logic with configurable attempts
+- Health check before creating session
+- Automatic session cleanup
+- Better error handling and recovery
 """
 import os
 import time
@@ -33,8 +37,13 @@ load_dotenv(BASE_DIR / ".env")
 logger = setup_logging("playwright_bridge")
 
 MILA_URL = os.getenv("MILA_URL", "").strip()
-TESTER_API_URL = os.getenv("TESTER_API_URL", "http://localhost:8501")  # HTTP API endpoint
+TESTER_API_URL = os.getenv("TESTER_API_URL", "http://localhost:8501")
 MAX_TURNS = int(os.getenv("MAX_TURNS", "10"))
+
+# ✅ NEW: Retry configuration
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5"))
+TESTER_API_TIMEOUT = float(os.getenv("TESTER_API_TIMEOUT", "120"))
 
 # Mila web login credentials
 MILA_LOGIN_USER = os.getenv("MILA_LOGIN_USER", "").strip()
@@ -54,6 +63,9 @@ logger.info(f"Configuration loaded:")
 logger.info(f"  MILA_URL: {MILA_URL}")
 logger.info(f"  TESTER_API_URL: {TESTER_API_URL}")
 logger.info(f"  MAX_TURNS: {MAX_TURNS}")
+logger.info(f"  MAX_RETRIES: {MAX_RETRIES}")
+logger.info(f"  RETRY_DELAY: {RETRY_DELAY}s")
+logger.info(f"  TESTER_API_TIMEOUT: {TESTER_API_TIMEOUT}s")
 logger.info(f"  Test Case: {TEST_CASE}")
 logger.info(f"  Persona: {TEST_PERSONA}")
 logger.debug(f"  Test Case Details: {TEST_CASE_DETAILS[:100]}...")
@@ -99,9 +111,44 @@ SELECTORS = {
 # TESTER BOT HTTP API FUNCTIONS
 # =====================================
 
+def check_tester_health() -> bool:
+    """Check if tester API is healthy"""
+    logger.info("Checking tester API health")
+    
+    try:
+        response = httpx.get(
+            f"{TESTER_API_URL}/health",
+            timeout=10.0
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        logger.info(f"✓ Tester API health check passed")
+        logger.debug(f"  Status: {data.get('status')}")
+        logger.debug(f"  Active sessions: {data.get('active_sessions')}")
+        logger.debug(f"  OpenAI available: {data.get('openai_available')}")
+        
+        print(f"✓ Tester API health check: OK")
+        print(f"  Active sessions: {data.get('active_sessions')}")
+        
+        return data.get('status') == 'ok'
+        
+    except Exception as e:
+        log_exception(logger, e, "check_tester_health")
+        logger.error(f"❌ Tester API health check failed: {e}")
+        print(f"❌ Tester API health check failed: {e}")
+        return False
+
+
 def create_tester_session() -> Optional[str]:
     """Create a new test session via HTTP API"""
     global tester_session_id
+    
+    # ✅ Check health first
+    if not check_tester_health():
+        logger.error("❌ Tester API is not healthy, cannot create session")
+        print("❌ Tester API is not healthy")
+        return None
     
     logger.info("Creating tester session via HTTP API")
     logger.debug(f"  Test case: {TEST_CASE}")
@@ -128,17 +175,19 @@ def create_tester_session() -> Optional[str]:
         tester_session_id = data.get("session_id")
         
         logger.info(f"✓ Created tester session: {tester_session_id}")
+        print(f"✓ Created tester session: {tester_session_id}")
         return tester_session_id
         
     except Exception as e:
         log_exception(logger, e, "create_tester_session")
         logger.error(f"❌ Error creating tester session: {e}")
+        print(f"❌ Error creating tester session: {e}")
         return None
 
 
-def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int], bool]]:
+def send_to_tester_api(message: str, retry_count: int = 0) -> Optional[Tuple[str, Optional[int], bool]]:
     """
-    Send message to tester bot via HTTP API.
+    Send message to tester bot via HTTP API with retry logic.
     
     Returns: (reply, score, should_continue) or None on error
     """
@@ -147,7 +196,7 @@ def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int], bool]
         print("❌ No active tester session")
         return None
     
-    logger.info(f"Sending message to tester API (session: {tester_session_id})")
+    logger.info(f"Sending message to tester API (session: {tester_session_id}, attempt {retry_count + 1}/{MAX_RETRIES})")
     logger.debug(f"  Message: {message[:100]}...")
     
     try:
@@ -155,35 +204,111 @@ def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int], bool]
         response = httpx.post(
             f"{TESTER_API_URL}/session/{tester_session_id}/message",
             json={"message": message},
-            timeout=120.0  # Long timeout for OpenAI calls
+            timeout=TESTER_API_TIMEOUT,
         )
         duration = time.time() - start_time
         
         log_api_call(logger, "POST", f"{TESTER_API_URL}/session/{tester_session_id}/message", 
                     response.status_code, duration)
         
+        # Handle different status codes
+        if response.status_code == 404:
+            logger.error("❌ Session not found on server - may have been cleaned up")
+            print("❌ Session not found on server")
+            return None
+        
         response.raise_for_status()
         data = response.json()
         reply = data.get("reply", "")
         score = data.get("score")
-        should_continue = data.get("should_continue", True)  # ✅ Extract should_continue
+        should_continue = data.get("should_continue", True)
+        error_count = data.get("error_count", 0)
         
         logger.info(f"✓ Received reply from tester API")
         logger.debug(f"  Score: {score}")
         logger.debug(f"  Should continue: {should_continue}")
+        logger.debug(f"  Error count: {error_count}")
         logger.debug(f"  Reply: {reply[:100]}...")
         
+        # Check if reply indicates an error
+        if reply.startswith("❌"):
+            logger.warning(f"⚠️ Tester returned error response: {reply}")
+            
+            # If it's a timeout or rate limit, retry
+            if "timeout" in reply.lower() or "rate limit" in reply.lower():
+                if retry_count < MAX_RETRIES - 1:
+                    logger.info(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})")
+                    print(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})...")
+                    time.sleep(RETRY_DELAY)
+                    return send_to_tester_api(message, retry_count + 1)
+        
         return reply, score, should_continue
+        
+    except httpx.TimeoutException as e:
+        log_exception(logger, e, "send_to_tester_api (timeout)")
+        logger.error(f"❌ Timeout after {TESTER_API_TIMEOUT}s")
+        print(f"❌ Timeout after {TESTER_API_TIMEOUT}s")
+        
+        # Retry on timeout
+        if retry_count < MAX_RETRIES - 1:
+            logger.info(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})")
+            print(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})...")
+            time.sleep(RETRY_DELAY)
+            return send_to_tester_api(message, retry_count + 1)
+        return None
+        
+    except httpx.HTTPStatusError as e:
+        log_exception(logger, e, "send_to_tester_api (HTTP error)")
+        logger.error(f"❌ HTTP error {e.response.status_code}: {e}")
+        print(f"❌ HTTP error {e.response.status_code}: {e}")
+        
+        # Retry on 5xx errors (server errors)
+        if 500 <= e.response.status_code < 600 and retry_count < MAX_RETRIES - 1:
+            logger.info(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})")
+            print(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})...")
+            time.sleep(RETRY_DELAY)
+            return send_to_tester_api(message, retry_count + 1)
+        return None
         
     except Exception as e:
         log_exception(logger, e, "send_to_tester_api")
         logger.error(f"❌ Error sending to tester API: {e}")
         print(f"❌ Error sending to tester API: {e}")
+        
+        # Generic retry
+        if retry_count < MAX_RETRIES - 1:
+            logger.info(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})")
+            print(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})...")
+            time.sleep(RETRY_DELAY)
+            return send_to_tester_api(message, retry_count + 1)
         return None
 
 
+def cleanup_tester_session():
+    """Delete the tester session when done"""
+    if not tester_session_id:
+        return
+    
+    logger.info(f"Cleaning up tester session: {tester_session_id}")
+    print(f"🧹 Cleaning up tester session...")
+    
+    try:
+        response = httpx.delete(
+            f"{TESTER_API_URL}/session/{tester_session_id}",
+            timeout=10.0
+        )
+        response.raise_for_status()
+        logger.info(f"✓ Cleaned up tester session")
+        print(f"✓ Cleaned up tester session")
+        
+    except Exception as e:
+        log_exception(logger, e, "cleanup_tester_session")
+        logger.warning(f"⚠️ Could not clean up session: {e}")
+        print(f"⚠️ Could not clean up session: {e}")
+
+
 # =====================================
-# MILA HELPERS (same as before)
+# MILA HELPERS
 # =====================================
 
 def wait_for_mila_typing_complete(page: Page, selector: str, timeout_ms: int = 60000):
@@ -613,9 +738,11 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     Run the headless bridge.
     Returns: (conversation_log, number_of_turns)
     
-    NEW FEATURES:
+    FEATURES:
     - Tracks actual number of turns completed
     - Exits early if completeness score >= 90
+    - Retry logic on failures
+    - Automatic session cleanup
     """
     global CONVERSATION_LOG
     CONVERSATION_LOG = []
@@ -629,202 +756,210 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     logger.info(f"Mila URL:        {MILA_URL}")
     logger.info(f"Tester API URL:  {TESTER_API_URL}")
     logger.info(f"Max turns:       {MAX_TURNS}")
+    logger.info(f"Max retries:     {MAX_RETRIES}")
+    logger.info(f"Retry delay:     {RETRY_DELAY}s")
     logger.info("=" * 80)
     
     print("Starting headless bridge bot...")
     print(f"Mila URL:        {MILA_URL}")
     print(f"Tester API URL:  {TESTER_API_URL}")
     print(f"Max turns:       {MAX_TURNS}")
+    print(f"Max retries:     {MAX_RETRIES}")
 
     if not MILA_URL:
         logger.error("❌ Missing MILA_URL in .env")
         print("❌ Missing MILA_URL in .env")
         return CONVERSATION_LOG, turns_completed
 
-    # Create tester session
+    # Create tester session (with health check)
     if not create_tester_session():
         logger.error("❌ Failed to create tester session")
         print("❌ Failed to create tester session")
         return CONVERSATION_LOG, turns_completed
 
-    logger.info("Launching browser in headless mode")
-    with sync_playwright() as p:
-        # Launch browser in HEADLESS mode
-        logger.debug("Browser args: headless=True, --no-sandbox, --disable-dev-shm-usage")
-        browser = p.chromium.launch(
-            headless=True,  # ← Headless!
-            args=['--no-sandbox', '--disable-dev-shm-usage']  # For Linux/Docker
-        )
-        logger.info("✓ Browser launched successfully")
+    try:
+        logger.info("Launching browser in headless mode")
+        with sync_playwright() as p:
+            # Launch browser in HEADLESS mode
+            logger.debug("Browser args: headless=True, --no-sandbox, --disable-dev-shm-usage")
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            logger.info("✓ Browser launched successfully")
 
-        ctx_kwargs_mila = {
-            "viewport": {"width": 1280, "height": 720},
-            "ignore_https_errors": True,
-        }
-        if MILA_HTTP_USER and MILA_HTTP_PASS:
-            ctx_kwargs_mila["http_credentials"] = {
-                "username": MILA_HTTP_USER,
-                "password": MILA_HTTP_PASS,
+            ctx_kwargs_mila = {
+                "viewport": {"width": 1280, "height": 720},
+                "ignore_https_errors": True,
             }
+            if MILA_HTTP_USER and MILA_HTTP_PASS:
+                ctx_kwargs_mila["http_credentials"] = {
+                    "username": MILA_HTTP_USER,
+                    "password": MILA_HTTP_PASS,
+                }
 
-        context_mila = browser.new_context(**ctx_kwargs_mila)
-        page_mila = context_mila.new_page()
+            context_mila = browser.new_context(**ctx_kwargs_mila)
+            page_mila = context_mila.new_page()
 
-        # ----- Mila -----
-        logger.info(f"➡️ Opening Mila at {MILA_URL}")
-        print("➡️ Opening Mila...")
-        page_mila.goto(MILA_URL)
-        page_mila.wait_for_load_state("networkidle")
-        logger.debug("✓ Page loaded (networkidle state)")
+            # ----- Mila -----
+            logger.info(f"➡️ Opening Mila at {MILA_URL}")
+            print("➡️ Opening Mila...")
+            page_mila.goto(MILA_URL)
+            page_mila.wait_for_load_state("networkidle")
+            logger.debug("✓ Page loaded (networkidle state)")
 
-        dismiss_cookie_banner(page_mila)
-        perform_mila_login(page_mila)
-        page_mila.wait_for_timeout(2000)
-        open_mila_chat(page_mila)
-        clear_mila_history(page_mila)
+            dismiss_cookie_banner(page_mila)
+            perform_mila_login(page_mila)
+            page_mila.wait_for_timeout(2000)
+            open_mila_chat(page_mila)
+            clear_mila_history(page_mila)
 
-        mila_sel = SELECTORS["mila"]["message_bubbles"]
+            mila_sel = SELECTORS["mila"]["message_bubbles"]
 
-        # ===== FIRST MILA MESSAGE =====
-        initial_mila_count = len(page_mila.query_selector_all(mila_sel))
-        logger.info(f"⏳ Waiting for Mila's first message... (current bubbles: {initial_mila_count})")
-        print(f"⏳ Waiting for Mila's first message... (bubbles: {initial_mila_count})")
-        try:
-            wait_for_new_message(page_mila, mila_sel, previous_count=0, timeout_ms=30000)
-            wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=30000)
-        except PlaywrightTimeoutError:
-            logger.error("❌ Mila didn't send first message (timeout)")
-            print("❌ Mila didn't send first message")
-            browser.close()
-            return CONVERSATION_LOG, turns_completed
-
-        mila_count = len(page_mila.query_selector_all(mila_sel))
-        mila_last = get_mila_last_message_text(page_mila, mila_sel)
-        
-        if not mila_last:
-            logger.error("❌ Failed to extract Mila's first message")
-            print("❌ Failed to extract Mila's first message")
-            browser.close()
-            return CONVERSATION_LOG, turns_completed
-        
-        logger.info(f"🟠 Mila first message ({len(mila_last)} chars):")
-        logger.debug(f"   {mila_last}")
-        print(f"🟠 Mila first message:\n{mila_last}\n")
-        CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
-
-        # ===== MAIN LOOP =====
-        logger.info(f"Starting main conversation loop (max {MAX_TURNS} turns)")
-        early_exit = False
-        early_exit_reason = ""
-        
-        for turn in range(1, MAX_TURNS + 1):
-            logger.info("=" * 60)
-            logger.info(f"TURN {turn}/{MAX_TURNS}")
-            logger.info("=" * 60)
-            print(f"========== TURN {turn} ==========")
-
-            # Mila → Tester (via HTTP API)
-            logger.debug(f"Sending Mila's message to tester API ({len(mila_last)} chars)")
-            result = send_to_tester_api(mila_last)
-            if result is None:
-                logger.error("❌ Tester API failed, stopping conversation")
-                print("❌ Tester API failed")
-                break
-            
-            tester_reply, score, should_continue = result
-            
-            # Format reply with score if available
-            if score is not None:
-                if score >= 80:
-                    score_badge = f"🟢 **Completeness: {score}/100**"
-                elif score >= 60:
-                    score_badge = f"🟡 **Completeness: {score}/100**"
-                elif score >= 40:
-                    score_badge = f"🟠 **Completeness: {score}/100**"
-                else:
-                    score_badge = f"🔴 **Completeness: {score}/100**"
-                
-                display_reply = f"{tester_reply}\n\n---\n{score_badge}"
-                logger.info(f"🧪 Tester reply with score {score}/100, should_continue={should_continue}")
-                
-                # ✅ CHECK FOR EARLY EXIT CONDITIONS
-                # Condition 1: High score (>= 90)
-                if score >= 90:
-                    logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 90")
-                    early_exit = True
-                    early_exit_reason = f"High score ({score}/100)"
-                
-                # ✅ Condition 2: should_continue=false AND score >= 80
-                if not should_continue and score >= 80:
-                    logger.info(f"✅ COMPLETION SIGNAL: should_continue=false AND score={score}/100 >= 80")
-                    early_exit = True
-                    early_exit_reason = f"Completion signal (score={score}/100, should_continue=false)"
-                
-                if early_exit:
-                    logger.info(f"✨ Exiting early - {early_exit_reason}")
-                    print(f"\n✨ EARLY EXIT: {early_exit_reason}")
-                    print(f"✅ Test case completed successfully!\n")
-            else:
-                display_reply = tester_reply
-                logger.info(f"🧪 Tester reply without score, should_continue={should_continue}")
-            
-            logger.debug(f"   Reply: {tester_reply[:100]}...")
-            print(f"🧪 Tester reply:\n{display_reply}\n")
-            CONVERSATION_LOG.append({"speaker": "Tester", "message": display_reply})
-            
-            # Increment turn counter (one full turn = Mila → Tester → Mila)
-            turns_completed = turn
-            
-            # Exit early if conditions met
-            if early_exit:
-                logger.info(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
-                print(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
-                break
-
-            # Tester → Mila
-            logger.debug(f"Sending tester's reply to Mila ({len(tester_reply)} chars)")
+            # ===== FIRST MILA MESSAGE =====
+            initial_mila_count = len(page_mila.query_selector_all(mila_sel))
+            logger.info(f"⏳ Waiting for Mila's first message... (current bubbles: {initial_mila_count})")
+            print(f"⏳ Waiting for Mila's first message... (bubbles: {initial_mila_count})")
             try:
-                send_message_to_mila(page_mila, tester_reply)
-            except Exception as e:
-                log_exception(logger, e, "send_message_to_mila")
-                logger.error(f"❌ Failed to send to Mila: {e}")
-                print(f"❌ Failed to send to Mila: {e}")
-                break
-
-            logger.debug("Waiting for Mila's response...")
-            try:
-                new_mila_count = wait_for_new_message(
-                    page_mila, mila_sel, mila_count, timeout_ms=45000
-                )
-                wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=60000)
+                wait_for_new_message(page_mila, mila_sel, previous_count=0, timeout_ms=30000)
+                wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=30000)
             except PlaywrightTimeoutError:
-                logger.error("❌ Mila did not reply (timeout)")
-                print("❌ Mila did not reply")
-                break
+                logger.error("❌ Mila didn't send first message (timeout)")
+                print("❌ Mila didn't send first message")
+                browser.close()
+                return CONVERSATION_LOG, turns_completed
 
-            mila_count = new_mila_count
+            mila_count = len(page_mila.query_selector_all(mila_sel))
             mila_last = get_mila_last_message_text(page_mila, mila_sel)
             
             if not mila_last:
-                logger.error("❌ Failed to extract Mila's reply")
-                print("❌ Failed to extract Mila's reply")
-                break
+                logger.error("❌ Failed to extract Mila's first message")
+                print("❌ Failed to extract Mila's first message")
+                browser.close()
+                return CONVERSATION_LOG, turns_completed
             
-            logger.info(f"🟠 Mila reply ({len(mila_last)} chars):")
-            logger.debug(f"   {mila_last[:100]}...")
-            print(f"🟠 Mila reply:\n{mila_last}\n")
+            logger.info(f"🟠 Mila first message ({len(mila_last)} chars):")
+            logger.debug(f"   {mila_last}")
+            print(f"🟠 Mila first message:\n{mila_last}\n")
             CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
 
-        logger.info("=" * 80)
-        logger.info(f"✅ Chat loop finished! Total turns: {turns_completed}")
-        logger.info(f"   Conversation entries: {len(CONVERSATION_LOG)}")
-        logger.info("=" * 80)
-        print(f"✅ Chat loop finished! Completed {turns_completed} turns")
-        time.sleep(2)
-        
-        logger.debug("Closing browser")
-        browser.close()
-        logger.info("✓ Browser closed")
+            # ===== MAIN LOOP =====
+            logger.info(f"Starting main conversation loop (max {MAX_TURNS} turns)")
+            early_exit = False
+            early_exit_reason = ""
+            
+            for turn in range(1, MAX_TURNS + 1):
+                logger.info("=" * 60)
+                logger.info(f"TURN {turn}/{MAX_TURNS}")
+                logger.info("=" * 60)
+                print(f"========== TURN {turn} ==========")
+
+                # Mila → Tester (via HTTP API)
+                logger.debug(f"Sending Mila's message to tester API ({len(mila_last)} chars)")
+                result = send_to_tester_api(mila_last)
+                if result is None:
+                    logger.error("❌ Tester API failed after all retries, stopping conversation")
+                    print("❌ Tester API failed after all retries")
+                    break
+                
+                tester_reply, score, should_continue = result
+                
+                # Format reply with score if available
+                if score is not None:
+                    if score >= 80:
+                        score_badge = f"🟢 **Completeness: {score}/100**"
+                    elif score >= 60:
+                        score_badge = f"🟡 **Completeness: {score}/100**"
+                    elif score >= 40:
+                        score_badge = f"🟠 **Completeness: {score}/100**"
+                    else:
+                        score_badge = f"🔴 **Completeness: {score}/100**"
+                    
+                    display_reply = f"{tester_reply}\n\n---\n{score_badge}"
+                    logger.info(f"🧪 Tester reply with score {score}/100, should_continue={should_continue}")
+                    
+                    # ✅ CHECK FOR EARLY EXIT CONDITIONS
+                    # Condition 1: High score (>= 90)
+                    if score >= 90:
+                        logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 90")
+                        early_exit = True
+                        early_exit_reason = f"High score ({score}/100)"
+                    
+                    # ✅ Condition 2: should_continue=false AND score >= 80
+                    if not should_continue and score >= 80:
+                        logger.info(f"✅ COMPLETION SIGNAL: should_continue=false AND score={score}/100 >= 80")
+                        early_exit = True
+                        early_exit_reason = f"Completion signal (score={score}/100, should_continue=false)"
+                    
+                    if early_exit:
+                        logger.info(f"✨ Exiting early - {early_exit_reason}")
+                        print(f"\n✨ EARLY EXIT: {early_exit_reason}")
+                        print(f"✅ Test case completed successfully!\n")
+                else:
+                    display_reply = tester_reply
+                    logger.info(f"🧪 Tester reply without score, should_continue={should_continue}")
+                
+                logger.debug(f"   Reply: {tester_reply[:100]}...")
+                print(f"🧪 Tester reply:\n{display_reply}\n")
+                CONVERSATION_LOG.append({"speaker": "Tester", "message": display_reply})
+                
+                # Increment turn counter (one full turn = Mila → Tester → Mila)
+                turns_completed = turn
+                
+                # Exit early if conditions met
+                if early_exit:
+                    logger.info(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
+                    print(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
+                    break
+
+                # Tester → Mila
+                logger.debug(f"Sending tester's reply to Mila ({len(tester_reply)} chars)")
+                try:
+                    send_message_to_mila(page_mila, tester_reply)
+                except Exception as e:
+                    log_exception(logger, e, "send_message_to_mila")
+                    logger.error(f"❌ Failed to send to Mila: {e}")
+                    print(f"❌ Failed to send to Mila: {e}")
+                    break
+
+                logger.debug("Waiting for Mila's response...")
+                try:
+                    new_mila_count = wait_for_new_message(
+                        page_mila, mila_sel, mila_count, timeout_ms=45000
+                    )
+                    wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=60000)
+                except PlaywrightTimeoutError:
+                    logger.error("❌ Mila did not reply (timeout)")
+                    print("❌ Mila did not reply")
+                    break
+
+                mila_count = new_mila_count
+                mila_last = get_mila_last_message_text(page_mila, mila_sel)
+                
+                if not mila_last:
+                    logger.error("❌ Failed to extract Mila's reply")
+                    print("❌ Failed to extract Mila's reply")
+                    break
+                
+                logger.info(f"🟠 Mila reply ({len(mila_last)} chars):")
+                logger.debug(f"   {mila_last[:100]}...")
+                print(f"🟠 Mila reply:\n{mila_last}\n")
+                CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
+
+            logger.info("=" * 80)
+            logger.info(f"✅ Chat loop finished! Total turns: {turns_completed}")
+            logger.info(f"   Conversation entries: {len(CONVERSATION_LOG)}")
+            logger.info("=" * 80)
+            print(f"✅ Chat loop finished! Completed {turns_completed} turns")
+            time.sleep(2)
+            
+            logger.debug("Closing browser")
+            browser.close()
+            logger.info("✓ Browser closed")
+
+    finally:
+        # ✅ Always cleanup session, even if there was an error
+        cleanup_tester_session()
 
     logger.info(f"Returning conversation log with {len(CONVERSATION_LOG)} entries and {turns_completed} turns")
     return CONVERSATION_LOG, turns_completed
