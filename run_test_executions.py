@@ -1,7 +1,11 @@
 # run_test_executions.py
+"""
+Continuous Test Execution Runner
+Monitors for test cases with status 'Not started' and executes them automatically.
+Runs in a loop like prepare_test_runs.py
+"""
 import os
 import time
-import re
 import pathlib
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -25,15 +29,16 @@ load_dotenv(BASE_DIR / ".env")
 logger = setup_logging("test_execution")
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-TEST_CASE_EXECUTIONS_PAGE_ID = os.getenv("TEST_CASE_EXECUTIONS_DB_ID")  # may be page OR db
+TEST_CASE_EXECUTIONS_PAGE_ID = os.getenv("TEST_CASE_EXECUTIONS_DB_ID")
 
-# Conversations parent page (from your URL)
-# https://www.notion.so/setaro/Conversations-2c7af83cf3e480538ec2c0cef1e96de6
-CONVERSATIONS_PARENT_PAGE_ID = os.getenv(
-    "CONVERSATIONS_PARENT_PAGE_ID")
+# Conversations parent page
+CONVERSATIONS_PARENT_PAGE_ID = os.getenv("CONVERSATIONS_PARENT_PAGE_ID")
 
 # Playwright bridge script
-BRIDGE_SCRIPT = os.getenv("BRIDGE_SCRIPT", "playwright_bridge_bot.py")
+BRIDGE_SCRIPT = os.getenv("BRIDGE_SCRIPT", "playwright_bridge_bot_headless.py")
+
+# ✅ NEW: Check interval configuration
+CHECK_INTERVAL = int(os.getenv("EXECUTION_CHECK_INTERVAL", "10"))  # seconds
 
 # Notion API
 NOTION_API_BASE = "https://api.notion.com/v1"
@@ -43,10 +48,11 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-logger.info("✓ Starting Test Case Executions Runner")
+logger.info("✓ Starting Test Case Executions Runner (Continuous Mode)")
 logger.info(f"Bridge Script: {BRIDGE_SCRIPT}")
 logger.info(f"Conversations Parent: {CONVERSATIONS_PARENT_PAGE_ID}")
-print("✓ Starting Test Case Executions Runner")
+logger.info(f"Check Interval: {CHECK_INTERVAL}s")
+print("✓ Starting Test Case Executions Runner (Continuous Mode)")
 
 
 # =====================================
@@ -99,14 +105,12 @@ def find_database_in_page(page_id: str) -> Optional[str]:
                 logger.info(f"✓ Found {btype} in page: {db_id}")
                 return db_id
 
-        # No child database; maybe the given ID is itself a database
         logger.debug("No child database found, using page ID as database ID")
         return page_id_uuid
         
     except Exception as e:
         log_exception(logger, e, "find_database_in_page")
         logger.warning(f"⚠️ Error finding database in page {page_id}: {e}")
-        # Fallback: assume it's a database
         return page_id_uuid
 
 
@@ -124,11 +128,9 @@ def extract_property_value(page: Dict[str, Any], property_name: str) -> Any:
             lst = prop.get("title", [])
             return lst[0]["plain_text"] if lst else ""
         elif prop_type == "rich_text":
-            # ✅ FIX: Concatenate ALL chunks, not just the first one
             lst = prop.get("rich_text", [])
             if not lst:
                 return ""
-            # Concatenate all rich_text chunks
             full_text = "".join(item.get("plain_text", "") for item in lst)
             logger.debug(f"Extracted rich_text '{property_name}': {len(full_text)} chars from {len(lst)} chunks")
             return full_text
@@ -162,8 +164,6 @@ def update_execution_row_with_results(
 ):
     """
     Update a Test Case Execution row with execution status, duration, date, turns, and conversation link.
-    
-    NEW: Added number_of_turns parameter to track conversation turns.
     """
     logger.info(f"Updating execution row: {execution_page_id}")
     logger.debug(f"  Status: {status}")
@@ -183,7 +183,6 @@ def update_execution_row_with_results(
         },
     }
     
-    # ✅ Add Number of Turns if available
     if number_of_turns is not None:
         properties["Number of Turns"] = {
             "number": number_of_turns
@@ -192,7 +191,6 @@ def update_execution_row_with_results(
 
     if conversation_page_id:
         url = notion_page_url(conversation_page_id)
-        # Conversation flow is rich_text in your schema
         properties["Conversation flow"] = {
             "rich_text": [
                 {
@@ -230,7 +228,7 @@ def update_execution_row_with_results(
         logger.error(f"❌ Error updating execution row {execution_page_id}: {e}")
         print(f"❌ Error updating execution row {execution_page_id}: {e}")
         try:
-            print("   Response:", resp.text)  # type: ignore[name-defined]
+            print("   Response:", resp.text)
         except Exception:
             pass
 
@@ -293,7 +291,7 @@ def get_pending_executions(db_id: str) -> List[Dict[str, Any]]:
             logger.error(f"❌ Error querying Test Case Executions DB: {e}")
             print(f"❌ Error querying Test Case Executions DB: {e}")
             try:
-                print("   Response:", resp.text)  # type: ignore[name-defined]
+                print("   Response:", resp.text)
             except Exception:
                 pass
             break
@@ -307,11 +305,10 @@ def get_pending_executions(db_id: str) -> List[Dict[str, Any]]:
 # =====================================
 
 def extract_turn_count_from_output(output: str) -> Optional[int]:
-    """
-    Extract number of turns from the bridge script output.
-    Looks for patterns like "Number of turns: 5" or "Completed 5 turns"
-    """
+    """Extract number of turns from the bridge script output."""
     logger.debug("Extracting turn count from output")
+    
+    import re
     
     # Try pattern: "Number of turns: X"
     match = re.search(r"Number of turns:\s*(\d+)", output, re.IGNORECASE)
@@ -346,11 +343,7 @@ def run_playwright_bridge(
 ) -> Tuple[str, Optional[int]]:
     """
     Run playwright_bridge_bot.py as a subprocess and capture stdout as conversation transcript.
-    Passes test case parameters as command-line arguments.
-    
     Returns: (conversation_text, number_of_turns)
-    
-    NEW: Extracts number of turns from the script output.
     """
     logger.info(f"Running Playwright bridge script: {BRIDGE_SCRIPT}")
     logger.debug(f"  Test case: {test_case_name}")
@@ -358,7 +351,6 @@ def run_playwright_bridge(
     logger.debug(f"  Details length: {len(test_case_details)} chars")
     logger.debug(f"  Prompt length: {len(test_case_prompt)} chars")
     
-    # Pass parameters as command-line arguments (more direct than env vars)
     cmd = [
         "python", 
         BRIDGE_SCRIPT,
@@ -392,7 +384,6 @@ def run_playwright_bridge(
         else:
             print("   ✓ Bridge script completed")
 
-        # Combine stdout + stderr as conversation trace (or keep only stdout)
         conversation_text = proc.stdout.strip()
         if not conversation_text:
             conversation_text = f"(No stdout captured. stderr was:)\n\n{proc.stderr}"
@@ -400,7 +391,6 @@ def run_playwright_bridge(
 
         logger.debug(f"Captured conversation: {len(conversation_text)} chars")
         
-        # ✅ Extract turn count from output
         number_of_turns = extract_turn_count_from_output(conversation_text)
         if number_of_turns is not None:
             logger.info(f"✓ Extracted turn count: {number_of_turns}")
@@ -419,10 +409,112 @@ def run_playwright_bridge(
 
 
 # =====================================
-# MAIN LOOP
+# SINGLE EXECUTION PROCESSOR
+# =====================================
+
+def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) -> bool:
+    """
+    Process a single test execution.
+    Returns True if successful, False otherwise.
+    """
+    page_id = execution.get("id")
+    
+    logger.info("\n" + "=" * 60)
+    logger.info(f"▶ Processing execution {page_id}")
+    logger.info("=" * 60)
+    print("\n" + "=" * 60)
+    print(f"▶ Processing execution {page_id}")
+    print("=" * 60)
+
+    test_case_name = extract_property_value(execution, "Test case name") or ""
+    persona = extract_property_value(execution, "Persona") or ""
+    test_case_details = extract_property_value(execution, "Test Case Details") or ""
+    test_case_prompt = extract_property_value(execution, "Test Case Prompt") or ""
+    run_number = extract_property_value(execution, "Test run number") or ""
+
+    logger.info(f"   Test case name: {test_case_name}")
+    logger.info(f"   Persona: {persona}")
+    logger.info(f"   Test run number: {run_number}")
+    logger.info(f"   📝 Test case prompt length: {len(test_case_prompt)} chars")
+    logger.info(f"   📋 Test case details length: {len(test_case_details)} chars")
+    print(f"   Test case name: {test_case_name}")
+    print(f"   Persona: {persona}")
+    print(f"   Test run number: {run_number}")
+    print(f"   📝 Prompt: {len(test_case_prompt)} chars")
+    print(f"   📋 Details: {len(test_case_details)} chars")
+
+    # Mark as "Test Execution Started"
+    try:
+        start_time = time.time()
+        resp = httpx.patch(
+            f"{NOTION_API_BASE}/pages/{page_id}",
+            headers=HEADERS,
+            json={
+                "properties": {
+                    "Test Execution Status": {
+                        "status": {"name": "Test Execustion Started"}
+                    }
+                }
+            },
+            timeout=30.0,
+        )
+        duration = time.time() - start_time
+        log_api_call(logger, "PATCH", f"{NOTION_API_BASE}/pages/{page_id}", 
+                    resp.status_code, duration)
+        
+        logger.info("   ✓ Marked as 'Test Execustion Started'")
+        print("   ✓ Marked as 'Test Execustion Started'")
+    except Exception as e:
+        log_exception(logger, e, "mark_execution_started")
+        logger.warning(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
+        print(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
+
+    # Run the bridge
+    start_ts = time.monotonic()
+    conversation_text, number_of_turns = run_playwright_bridge(
+        test_case_name=test_case_name,
+        persona=persona,
+        test_case_details=test_case_details,
+        test_case_prompt=test_case_prompt,
+    )
+    duration = time.monotonic() - start_ts
+
+    logger.info(f"   ⏱ Execution duration: {duration:.1f} seconds")
+    print(f"   ⏱ Execution duration: {duration:.1f} seconds")
+    
+    if number_of_turns is not None:
+        logger.info(f"   🔄 Number of turns: {number_of_turns}")
+        print(f"   🔄 Number of turns: {number_of_turns}")
+
+    # Create conversation page
+    conv_title = f"Conversation – {run_number or ''} – {test_case_name or page_id}"
+    logger.info(f"Creating conversation page: {conv_title}")
+    
+    conv_page_id = create_formatted_conversation_page(
+        parent_page_id=CONVERSATIONS_PARENT_PAGE_ID,
+        title=conv_title,
+        conversation_text=conversation_text,
+    )
+
+    # Update execution row
+    update_execution_row_with_results(
+        execution_page_id=page_id,
+        status="Test Executed",
+        duration_seconds=duration,
+        conversation_page_id=conv_page_id,
+        number_of_turns=number_of_turns,
+    )
+    
+    logger.info(f"✓ Execution {page_id} completed successfully")
+    return True
+
+
+# =====================================
+# CONTINUOUS MONITORING LOOP
 # =====================================
 
 def verify_env() -> bool:
+    """Verify all required environment variables are set"""
     logger.debug("Verifying environment variables")
     missing = []
     if not NOTION_API_KEY:
@@ -444,16 +536,20 @@ def verify_env() -> bool:
     return True
 
 
-def main():
+def run_execution_loop(check_interval: int = 10):
+    """
+    Continuously monitor for pending test executions and run them.
+    Similar to prepare_test_runs.py
+    """
     logger.info("=" * 80)
-    logger.info("MAIN EXECUTION STARTED")
+    logger.info("🚀 Test Execution Service Started (Continuous Mode)")
     logger.info("=" * 80)
+    print("🚀 Test Execution Service Started (Continuous Mode)")
     
     if not verify_env():
-        logger.error("Environment verification failed, exiting")
         return
 
-    # Auto-discover DB ID from page (same style as prepare_test_runs.py)
+    # Auto-discover DB ID from page
     test_exec_db_id = find_database_in_page(TEST_CASE_EXECUTIONS_PAGE_ID)
     logger.info(f"   • Test Case Executions DB: {test_exec_db_id}")
     print(f"   • Test Case Executions DB: {test_exec_db_id}")
@@ -463,110 +559,72 @@ def main():
         print("❌ Could not resolve Test Case Executions DB ID.")
         return
 
-    # Fetch pending executions
-    pending = get_pending_executions(test_exec_db_id)
-
-    if not pending:
-        logger.info("No pending executions. Exiting.")
-        print("No pending executions. Exiting.")
-        return
-
-    logger.info(f"🔔 Found {len(pending)} pending execution(s)")
-    print(f"🔔 Found {len(pending)} pending execution(s).")
-
-    for idx, execution in enumerate(pending, start=1):
-        page_id = execution.get("id")
-        logger.info("\n" + "=" * 60)
-        logger.info(f"▶ [{idx}/{len(pending)}] Processing execution {page_id}")
-        logger.info("=" * 60)
-        print("\n" + "=" * 60)
-        print(f"▶ [{idx}/{len(pending)}] Processing execution {page_id}")
-        print("=" * 60)
-
-        test_case_name = extract_property_value(execution, "Test case name") or ""
-        persona = extract_property_value(execution, "Persona") or ""
-        test_case_details = extract_property_value(execution, "Test Case Details") or ""
-        test_case_prompt = extract_property_value(execution, "Test Case Prompt") or ""
-        run_number = extract_property_value(execution, "Test run number") or ""
-
-        logger.info(f"   Test case name: {test_case_name}")
-        logger.info(f"   Persona: {persona}")
-        logger.info(f"   Test run number: {run_number}")
-        logger.info(f"   📝 Test case prompt length: {len(test_case_prompt)} chars")
-        logger.info(f"   📋 Test case details length: {len(test_case_details)} chars")
-        print(f"   Test case name: {test_case_name}")
-        print(f"   Persona: {persona}")
-        print(f"   Test run number: {run_number}")
-        print(f"   📝 Prompt: {len(test_case_prompt)} chars")
-        print(f"   📋 Details: {len(test_case_details)} chars")
-
-        # Mark as "Test Execustion Started" BEFORE running bridge (if such status exists)
+    logger.info(f"⏰ Checking every {check_interval} seconds...")
+    print(f"⏰ Checking every {check_interval} seconds...\n")
+    
+    iteration = 0
+    
+    while True:
         try:
-            start_time = time.time()
-            resp = httpx.patch(
-                f"{NOTION_API_BASE}/pages/{page_id}",
-                headers=HEADERS,
-                json={
-                    "properties": {
-                        "Test Execution Status": {
-                            # NOTE: option name has typo in your schema: 'Test Execustion Started'
-                            "status": {"name": "Test Execustion Started"}
-                        }
-                    }
-                },
-                timeout=30.0,
-            )
-            duration = time.time() - start_time
-            log_api_call(logger, "PATCH", f"{NOTION_API_BASE}/pages/{page_id}", 
-                        resp.status_code, duration)
+            iteration += 1
+            logger.debug(f"Check iteration #{iteration}")
             
-            logger.info("   ✓ Marked as 'Test Execustion Started'")
-            print("   ✓ Marked as 'Test Execustion Started'")
+            # Fetch pending executions
+            pending = get_pending_executions(test_exec_db_id)
+
+            if not pending:
+                # Only log to file, print to console with \r to overwrite
+                logger.debug("💤 No pending executions")
+                print("💤 No pending executions...", end="\r")
+            else:
+                logger.info(f"🔔 Found {len(pending)} pending execution(s)")
+                print(f"\n🔔 Found {len(pending)} pending execution(s)")
+                
+                # Process each execution
+                for idx, execution in enumerate(pending, start=1):
+                    logger.info(f"\n[{idx}/{len(pending)}] Processing execution...")
+                    print(f"\n[{idx}/{len(pending)}] Processing execution...")
+                    
+                    try:
+                        success = process_single_execution(execution, test_exec_db_id)
+                        if success:
+                            logger.info(f"✅ Execution {idx}/{len(pending)} completed")
+                            print(f"✅ Execution {idx}/{len(pending)} completed")
+                        else:
+                            logger.warning(f"⚠️ Execution {idx}/{len(pending)} had issues")
+                            print(f"⚠️ Execution {idx}/{len(pending)} had issues")
+                    except Exception as e:
+                        log_exception(logger, e, f"process_execution_{idx}")
+                        logger.error(f"❌ Error processing execution {idx}/{len(pending)}: {e}")
+                        print(f"❌ Error processing execution {idx}/{len(pending)}: {e}")
+                        # Continue with next execution even if one fails
+                        continue
+            
+            time.sleep(check_interval)
+            
+        except KeyboardInterrupt:
+            logger.warning("\n👋 Shutting down...")
+            print("\n\n👋 Shutting down...")
+            break
         except Exception as e:
-            log_exception(logger, e, "mark_execution_started")
-            logger.warning(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
-            print(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
+            log_exception(logger, e, "execution loop")
+            logger.error(f"\n❌ Error in execution loop: {e}")
+            print(f"\n❌ Error in execution loop: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(check_interval)
 
-        start_ts = time.monotonic()
-        conversation_text, number_of_turns = run_playwright_bridge(
-            test_case_name=test_case_name,
-            persona=persona,
-            test_case_details=test_case_details,
-            test_case_prompt=test_case_prompt,
-        )
-        duration = time.monotonic() - start_ts
 
-        logger.info(f"   ⏱ Execution duration: {duration:.1f} seconds")
-        print(f"   ⏱ Execution duration: {duration:.1f} seconds")
-        
-        if number_of_turns is not None:
-            logger.info(f"   🔄 Number of turns: {number_of_turns}")
-            print(f"   🔄 Number of turns: {number_of_turns}")
+# =====================================
+# MAIN
+# =====================================
 
-        # Create conversation page under Conversations parent
-        # NOW USING THE IMPROVED FORMATTER!
-        conv_title = f"Conversation – {run_number or ''} – {test_case_name or page_id}"
-        logger.info(f"Creating conversation page: {conv_title}")
-        
-        conv_page_id = create_formatted_conversation_page(
-            parent_page_id=CONVERSATIONS_PARENT_PAGE_ID,
-            title=conv_title,
-            conversation_text=conversation_text,
-        )
-
-        # Update execution row with turn count
-        update_execution_row_with_results(
-            execution_page_id=page_id,
-            status="Test Executed",
-            duration_seconds=duration,
-            conversation_page_id=conv_page_id,
-            number_of_turns=number_of_turns,  # ✅ Pass turn count
-        )
-
-    logger.info("\n" + "=" * 80)
-    logger.info("✅ All pending executions processed")
+def main():
     logger.info("=" * 80)
-    print("\n✅ All pending executions processed.")
+    logger.info("MAIN EXECUTION STARTED (Continuous Mode)")
+    logger.info("=" * 80)
+    
+    run_execution_loop(check_interval=CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
