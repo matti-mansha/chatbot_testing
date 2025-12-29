@@ -3,17 +3,20 @@
 Headless testing bot that replaces the Streamlit app.
 Can be run via HTTP server for Playwright to interact with.
 
-MODIFICATIONS:
-- Replaces {{max_turns}} placeholder in prompt
-- Returns should_continue flag from JSON response
+IMPROVEMENTS:
+- Added timeout to OpenAI calls
+- Session cleanup after inactivity
+- Health check endpoint
+- Better error handling and recovery
 """
 import os
 import json
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
-import threading
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from logging_config import setup_logging, log_exception
@@ -26,12 +29,16 @@ logger = setup_logging("test_bot_headless")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL")
-MAX_TURNS = os.getenv("MAX_TURNS", "10")  # ✅ Load MAX_TURNS
+MAX_TURNS = os.getenv("MAX_TURNS", "10")
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))  # ✅ NEW: Configurable timeout
+SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))  # ✅ NEW: Session cleanup
 
 logger.info("✓ Test Bot Headless Service Starting")
 logger.info(f"OpenAI Model: {OPENAI_MODEL}")
 logger.info(f"OpenAI API Key: {'✓ Set' if OPENAI_API_KEY else '✗ Missing'}")
 logger.info(f"MAX_TURNS: {MAX_TURNS}")
+logger.info(f"OpenAI Timeout: {OPENAI_TIMEOUT}s")
+logger.info(f"Session Timeout: {SESSION_TIMEOUT_MINUTES} minutes")
 
 try:
     from openai import OpenAI
@@ -59,10 +66,22 @@ class TestBotSession:
         self.test_case_prompt = test_case_prompt
         self.chat_history: List[Dict[str, str]] = []
         self.score_history: List[int] = []
+        self.created_at = datetime.now()
+        self.last_activity = datetime.now()  # ✅ NEW: Track last activity
+        self.error_count = 0  # ✅ NEW: Track consecutive errors
         
         logger.info(f"Created new session: {test_case} / {persona}")
         logger.debug(f"  Details length: {len(test_case_details)} chars")
         logger.debug(f"  Prompt length: {len(test_case_prompt)} chars")
+    
+    def update_activity(self):
+        """Update last activity timestamp"""
+        self.last_activity = datetime.now()
+    
+    def is_expired(self) -> bool:
+        """Check if session has expired due to inactivity"""
+        age = datetime.now() - self.last_activity
+        return age > timedelta(minutes=SESSION_TIMEOUT_MINUTES)
     
     def build_system_prompt(self) -> str:
         """Build system prompt with placeholders replaced"""
@@ -80,7 +99,7 @@ class TestBotSession:
             .replace("{{test_case}}", self.test_case)
             .replace("{{persona}}", self.persona)
             .replace("{{test_case_details}}", self.test_case_details)
-            .replace("{{max_turns}}", max_turns)  # ✅ ADD MAX_TURNS
+            .replace("{{max_turns}}", max_turns)
         )
         
         logger.debug(f"System prompt length: {len(prompt)} chars")
@@ -108,18 +127,20 @@ class TestBotSession:
             data = json.loads(clean_reply)
             message = data.get("message", "")
             score = data.get("completeness_score")
-            should_continue = data.get("should_continue", True)  # ✅ Extract should_continue
+            should_continue = data.get("should_continue", True)
             
             if score is not None:
                 score = int(score)
                 score = max(1, min(100, score))
             
             logger.debug(f"Parsed: message={len(message)} chars, score={score}, should_continue={should_continue}")
+            self.error_count = 0  # ✅ Reset error count on success
             return message, score, should_continue
             
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.warning(f"JSON parse failed, returning raw reply: {e}")
-            return reply, None, True  # ✅ Default to continue on parse error
+            self.error_count += 1
+            return reply, None, True
     
     def get_response(self, user_message: str) -> Tuple[str, Optional[int], bool]:
         """
@@ -131,6 +152,8 @@ class TestBotSession:
         logger.info(f"Getting AI response (turn {turn_number})")
         logger.debug(f"User message: {user_message[:100]}...")
         
+        self.update_activity()  # ✅ Update activity timestamp
+        
         if openai_client is None:
             logger.error("OPENAI_API_KEY not configured")
             return "❌ OPENAI_API_KEY not configured", None, False
@@ -139,10 +162,16 @@ class TestBotSession:
             logger.error("OPENAI_MODEL not set")
             return "❌ OPENAI_MODEL not set", None, False
         
+        # ✅ Check for too many consecutive errors
+        if self.error_count >= 3:
+            logger.error("Too many consecutive errors, stopping session")
+            return "❌ Too many consecutive errors. Please restart the session.", None, False
+        
         try:
             system_prompt = self.build_system_prompt()
         except Exception as e:
             log_exception(logger, e, "build_system_prompt")
+            self.error_count += 1
             return f"❌ System prompt error: {e}", None, False
         
         messages: List[Dict[str, str]] = [
@@ -155,15 +184,16 @@ class TestBotSession:
         
         messages.append({"role": "user", "content": user_message})
         
-        logger.debug(f"Calling OpenAI with {len(messages)} messages")
+        logger.debug(f"Calling OpenAI with {len(messages)} messages (timeout: {OPENAI_TIMEOUT}s)")
         
         try:
-            import time
             start_time = time.time()
             
+            # ✅ ADD TIMEOUT TO OPENAI CALL
             resp = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=messages,
+                timeout=OPENAI_TIMEOUT,  # ✅ NEW: Add explicit timeout
             )
             
             duration = time.time() - start_time
@@ -190,11 +220,36 @@ class TestBotSession:
         except Exception as e:
             log_exception(logger, e, "OpenAI API call")
             logger.error(f"❌ OpenAI error: {e}")
-            return f"❌ OpenAI error: {e}", None, False
+            self.error_count += 1
+            
+            # ✅ Return different messages based on error type
+            error_str = str(e).lower()
+            if "timeout" in error_str:
+                return f"❌ OpenAI timeout after {OPENAI_TIMEOUT}s. Please try again.", None, True
+            elif "rate limit" in error_str:
+                return f"❌ OpenAI rate limit exceeded. Please wait a moment and try again.", None, True
+            else:
+                return f"❌ OpenAI error: {e}", None, False
 
 
 # Global session storage
 active_sessions: Dict[str, TestBotSession] = {}
+
+
+# ✅ NEW: Session cleanup function
+def cleanup_expired_sessions():
+    """Remove expired sessions from memory"""
+    expired = [
+        sid for sid, session in active_sessions.items()
+        if session.is_expired()
+    ]
+    
+    for sid in expired:
+        logger.info(f"Cleaning up expired session: {sid}")
+        del active_sessions[sid]
+    
+    if expired:
+        logger.info(f"Cleaned up {len(expired)} expired sessions. Active: {len(active_sessions)}")
 
 
 class TestBotHandler(BaseHTTPRequestHandler):
@@ -205,12 +260,43 @@ class TestBotHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         logger.debug(f"GET {parsed.path}")
         
+        # ✅ Run cleanup on every request (lightweight operation)
+        cleanup_expired_sessions()
+        
         if parsed.path == "/health":
             logger.debug("Health check OK")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok"}).encode())
+            self.wfile.write(json.dumps({
+                "status": "ok",
+                "active_sessions": len(active_sessions),
+                "openai_available": OPENAI_AVAILABLE,
+                "openai_model": OPENAI_MODEL
+            }).encode())
+        
+        elif parsed.path == "/sessions":
+            # ✅ NEW: List all active sessions
+            logger.debug("Listing active sessions")
+            sessions_info = {
+                sid: {
+                    "test_case": session.test_case,
+                    "persona": session.persona,
+                    "turns": len(session.chat_history),
+                    "created_at": session.created_at.isoformat(),
+                    "last_activity": session.last_activity.isoformat(),
+                    "age_minutes": (datetime.now() - session.created_at).total_seconds() / 60
+                }
+                for sid, session in active_sessions.items()
+            }
+            
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "count": len(active_sessions),
+                "sessions": sessions_info
+            }, indent=2).encode())
         
         elif parsed.path == "/":
             # Serve a simple HTML interface for testing
@@ -218,20 +304,26 @@ class TestBotHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            html = """
+            html = f"""
             <!DOCTYPE html>
             <html>
             <head><title>Test Bot - Headless</title></head>
             <body>
                 <h1>🧪 Test Bot - Headless Mode</h1>
                 <p>This is the headless testing bot API.</p>
-                <p>Use the API endpoints to interact with the bot.</p>
+                <p><strong>Status:</strong> ✅ Running</p>
+                <p><strong>Active Sessions:</strong> {len(active_sessions)}</p>
+                <p><strong>OpenAI Model:</strong> {OPENAI_MODEL}</p>
+                <p><strong>OpenAI Timeout:</strong> {OPENAI_TIMEOUT}s</p>
+                <p><strong>Session Timeout:</strong> {SESSION_TIMEOUT_MINUTES} minutes</p>
                 <h2>Endpoints:</h2>
                 <ul>
                     <li>GET /health - Health check</li>
+                    <li>GET /sessions - List active sessions</li>
                     <li>POST /session/create - Create new session</li>
-                    <li>POST /session/{id}/message - Send message</li>
-                    <li>GET /session/{id}/history - Get chat history</li>
+                    <li>POST /session/{{id}}/message - Send message</li>
+                    <li>GET /session/{{id}}/history - Get chat history</li>
+                    <li>DELETE /session/{{id}} - Delete session</li>
                 </ul>
             </body>
             </html>
@@ -252,6 +344,7 @@ class TestBotHandler(BaseHTTPRequestHandler):
                 return
             
             session = active_sessions[session_id]
+            session.update_activity()
             logger.debug(f"Returning {len(session.chat_history)} history entries")
             
             self.send_response(200)
@@ -273,6 +366,9 @@ class TestBotHandler(BaseHTTPRequestHandler):
         """Handle POST requests"""
         parsed = urlparse(self.path)
         logger.debug(f"POST {parsed.path}")
+        
+        # ✅ Run cleanup on every request
+        cleanup_expired_sessions()
         
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length).decode()
@@ -308,8 +404,8 @@ class TestBotHandler(BaseHTTPRequestHandler):
                 }).encode())
                 return
             
-            # Generate session ID
-            session_id = f"session_{len(active_sessions) + 1}"
+            # Generate session ID with timestamp to ensure uniqueness
+            session_id = f"session_{int(time.time())}_{len(active_sessions)}"
             
             # Create session
             session = TestBotSession(
@@ -364,12 +460,52 @@ class TestBotHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({
                 "reply": reply,
                 "score": score,
-                "should_continue": should_continue,  # ✅ Return should_continue
-                "turn": len(session.chat_history)
+                "should_continue": should_continue,
+                "turn": len(session.chat_history),
+                "error_count": session.error_count
             }).encode())
         
         else:
             logger.debug(f"Path not found: {parsed.path}")
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+    
+    def do_DELETE(self):
+        """Handle DELETE requests"""
+        parsed = urlparse(self.path)
+        logger.debug(f"DELETE {parsed.path}")
+        
+        if parsed.path.startswith("/session/"):
+            # Delete a specific session
+            parts = parsed.path.split("/")
+            if len(parts) >= 3:
+                session_id = parts[2]
+                logger.info(f"Deleting session: {session_id}")
+                
+                if session_id in active_sessions:
+                    del active_sessions[session_id]
+                    logger.info(f"✓ Deleted session: {session_id}")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "message": f"Session {session_id} deleted",
+                        "active_sessions": len(active_sessions)
+                    }).encode())
+                else:
+                    logger.warning(f"Session not found: {session_id}")
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Session not found"}).encode())
+            else:
+                self.send_response(400)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Invalid path")
+        else:
             self.send_response(404)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -391,13 +527,17 @@ def run_server(port: int = 8501):
     logger.info(f"OpenAI Model: {OPENAI_MODEL}")
     logger.info(f"OpenAI API Key: {'✓ Set' if OPENAI_API_KEY else '✗ Missing'}")
     logger.info(f"OpenAI Available: {OPENAI_AVAILABLE}")
+    logger.info(f"OpenAI Timeout: {OPENAI_TIMEOUT}s")
     logger.info(f"MAX_TURNS: {MAX_TURNS}")
+    logger.info(f"Session Timeout: {SESSION_TIMEOUT_MINUTES} minutes")
     logger.info("=" * 80)
     
     print(f"🧪 Test Bot Server running on http://0.0.0.0:{port}")
     print(f"   OpenAI Model: {OPENAI_MODEL}")
     print(f"   OpenAI API Key: {'✓ Set' if OPENAI_API_KEY else '✗ Missing'}")
+    print(f"   OpenAI Timeout: {OPENAI_TIMEOUT}s")
     print(f"   MAX_TURNS: {MAX_TURNS}")
+    print(f"   Session Timeout: {SESSION_TIMEOUT_MINUTES} minutes")
     
     server = HTTPServer(('0.0.0.0', port), TestBotHandler)
     
