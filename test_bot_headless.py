@@ -394,7 +394,7 @@ class TestBotHandler(BaseHTTPRequestHandler):
             logger.debug(f"  Test case: {test_case}")
             logger.debug(f"  Persona: {persona}")
             
-            if not test_case or not persona or not test_case_prompt:
+            if not test_case or not persona:
                 logger.error("Missing required fields for session creation")
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
