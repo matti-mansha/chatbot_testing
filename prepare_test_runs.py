@@ -171,7 +171,7 @@ def get_latest_child_page_id(parent_page_id: str) -> Optional[str]:
     return latest_id
 
 
-def split_text_for_notion(text: str, max_length: int = 2000) -> List[Dict[str, Any]]:
+def split_text_for_notion(text: str, max_length: int = 1800) -> List[Dict[str, Any]]:
     """
     Split long text into chunks for Notion rich_text (max 2000 chars per block).
     Returns a list of rich_text objects.
