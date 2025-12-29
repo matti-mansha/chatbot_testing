@@ -2,13 +2,17 @@
 """
 Headless version of the Playwright bridge.
 Uses HTTP API instead of Streamlit for the tester bot.
+
+MODIFICATIONS:
+- Tracks number of turns
+- Breaks loop early if completeness score >= 85
 """
 import os
 import time
 import pathlib
 import sys
 import httpx
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 from playwright.sync_api import (
     sync_playwright,
@@ -132,8 +136,8 @@ def create_tester_session() -> Optional[str]:
         return None
 
 
-def send_to_tester_api(message: str) -> Optional[tuple[str, Optional[int]]]:
-    """Send message to tester bot via HTTP API"""
+def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int]]]:
+    """Send message to tester bot via HTTP API. Returns (reply, score)"""
     if not tester_session_id:
         logger.error("❌ No active tester session")
         print("❌ No active tester session")
@@ -597,10 +601,20 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
 # MAIN BRIDGE FUNCTION
 # =====================================
 
-def run_bridge() -> List[Dict[str, str]]:
-    """Run the headless bridge"""
+def run_bridge() -> Tuple[List[Dict[str, str]], int]:
+    """
+    Run the headless bridge.
+    Returns: (conversation_log, number_of_turns)
+    
+    NEW FEATURES:
+    - Tracks actual number of turns completed
+    - Exits early if completeness score >= 85
+    """
     global CONVERSATION_LOG
     CONVERSATION_LOG = []
+    
+    # Track actual turns completed
+    turns_completed = 0
 
     logger.info("=" * 80)
     logger.info("Starting headless bridge bot")
@@ -618,13 +632,13 @@ def run_bridge() -> List[Dict[str, str]]:
     if not MILA_URL:
         logger.error("❌ Missing MILA_URL in .env")
         print("❌ Missing MILA_URL in .env")
-        return CONVERSATION_LOG
+        return CONVERSATION_LOG, turns_completed
 
     # Create tester session
     if not create_tester_session():
         logger.error("❌ Failed to create tester session")
         print("❌ Failed to create tester session")
-        return CONVERSATION_LOG
+        return CONVERSATION_LOG, turns_completed
 
     logger.info("Launching browser in headless mode")
     with sync_playwright() as p:
@@ -675,7 +689,7 @@ def run_bridge() -> List[Dict[str, str]]:
             logger.error("❌ Mila didn't send first message (timeout)")
             print("❌ Mila didn't send first message")
             browser.close()
-            return CONVERSATION_LOG
+            return CONVERSATION_LOG, turns_completed
 
         mila_count = len(page_mila.query_selector_all(mila_sel))
         mila_last = get_mila_last_message_text(page_mila, mila_sel)
@@ -684,7 +698,7 @@ def run_bridge() -> List[Dict[str, str]]:
             logger.error("❌ Failed to extract Mila's first message")
             print("❌ Failed to extract Mila's first message")
             browser.close()
-            return CONVERSATION_LOG
+            return CONVERSATION_LOG, turns_completed
         
         logger.info(f"🟠 Mila first message ({len(mila_last)} chars):")
         logger.debug(f"   {mila_last}")
@@ -693,6 +707,8 @@ def run_bridge() -> List[Dict[str, str]]:
 
         # ===== MAIN LOOP =====
         logger.info(f"Starting main conversation loop (max {MAX_TURNS} turns)")
+        early_exit = False
+        
         for turn in range(1, MAX_TURNS + 1):
             logger.info("=" * 60)
             logger.info(f"TURN {turn}/{MAX_TURNS}")
@@ -722,6 +738,14 @@ def run_bridge() -> List[Dict[str, str]]:
                 
                 display_reply = f"{tester_reply}\n\n---\n{score_badge}"
                 logger.info(f"🧪 Tester reply with score {score}/100 ({len(tester_reply)} chars)")
+                
+                # ✅ CHECK FOR EARLY EXIT (score >= 85)
+                if score >= 85:
+                    logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 85")
+                    logger.info("✨ Exiting early - test case completed successfully!")
+                    print(f"\n🎯 HIGH SCORE DETECTED: {score}/100 >= 85")
+                    print("✨ Exiting early - test case completed successfully!\n")
+                    early_exit = True
             else:
                 display_reply = tester_reply
                 logger.info(f"🧪 Tester reply without score ({len(tester_reply)} chars)")
@@ -729,6 +753,15 @@ def run_bridge() -> List[Dict[str, str]]:
             logger.debug(f"   Reply: {tester_reply[:100]}...")
             print(f"🧪 Tester reply:\n{display_reply}\n")
             CONVERSATION_LOG.append({"speaker": "Tester", "message": display_reply})
+            
+            # Increment turn counter (one full turn = Mila → Tester → Mila)
+            turns_completed = turn
+            
+            # Exit early if score is high enough
+            if early_exit:
+                logger.info(f"✅ Completed {turns_completed} turns (early exit on high score)")
+                print(f"✅ Completed {turns_completed} turns (early exit on high score)")
+                break
 
             # Tester → Mila
             logger.debug(f"Sending tester's reply to Mila ({len(tester_reply)} chars)")
@@ -765,17 +798,18 @@ def run_bridge() -> List[Dict[str, str]]:
             CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
 
         logger.info("=" * 80)
-        logger.info(f"✅ Chat loop finished! Total conversation turns: {len(CONVERSATION_LOG)}")
+        logger.info(f"✅ Chat loop finished! Total turns: {turns_completed}")
+        logger.info(f"   Conversation entries: {len(CONVERSATION_LOG)}")
         logger.info("=" * 80)
-        print("✅ Chat loop finished!")
+        print(f"✅ Chat loop finished! Completed {turns_completed} turns")
         time.sleep(2)
         
         logger.debug("Closing browser")
         browser.close()
         logger.info("✓ Browser closed")
 
-    logger.info(f"Returning conversation log with {len(CONVERSATION_LOG)} entries")
-    return CONVERSATION_LOG
+    logger.info(f"Returning conversation log with {len(CONVERSATION_LOG)} entries and {turns_completed} turns")
+    return CONVERSATION_LOG, turns_completed
 
 
 if __name__ == "__main__":
@@ -783,8 +817,13 @@ if __name__ == "__main__":
     logger.info(f"Command line arguments: {sys.argv}")
     
     try:
-        conversation_log = run_bridge()
-        logger.info(f"✅ Script completed successfully. Conversation entries: {len(conversation_log)}")
+        conversation_log, num_turns = run_bridge()
+        logger.info(f"✅ Script completed successfully")
+        logger.info(f"   Conversation entries: {len(conversation_log)}")
+        logger.info(f"   Number of turns: {num_turns}")
+        print(f"\n📊 Summary:")
+        print(f"   Conversation entries: {len(conversation_log)}")
+        print(f"   Number of turns: {num_turns}")
     except KeyboardInterrupt:
         logger.warning("⚠️ Script interrupted by user (Ctrl+C)")
         print("\n⚠️ Interrupted by user")

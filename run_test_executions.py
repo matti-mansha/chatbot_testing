@@ -1,9 +1,10 @@
 # run_test_executions.py
 import os
 import time
+import re
 import pathlib
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import subprocess
 
 from dotenv import load_dotenv
@@ -151,11 +152,17 @@ def update_execution_row_with_results(
     status: str,
     duration_seconds: float,
     conversation_page_id: Optional[str],
+    number_of_turns: Optional[int] = None,
 ):
-    """Update a Test Case Execution row with execution status, duration, date, and conversation link."""
+    """
+    Update a Test Case Execution row with execution status, duration, date, turns, and conversation link.
+    
+    NEW: Added number_of_turns parameter to track conversation turns.
+    """
     logger.info(f"Updating execution row: {execution_page_id}")
     logger.debug(f"  Status: {status}")
     logger.debug(f"  Duration: {duration_seconds:.2f}s")
+    logger.debug(f"  Number of turns: {number_of_turns}")
     logger.debug(f"  Conversation page: {conversation_page_id}")
     
     properties: Dict[str, Any] = {
@@ -169,6 +176,13 @@ def update_execution_row_with_results(
             "date": {"start": datetime.now().isoformat()}
         },
     }
+    
+    # ✅ Add Number of Turns if available
+    if number_of_turns is not None:
+        properties["Number of Turns"] = {
+            "number": number_of_turns
+        }
+        logger.debug(f"  Added Number of Turns: {number_of_turns}")
 
     if conversation_page_id:
         url = notion_page_url(conversation_page_id)
@@ -199,7 +213,11 @@ def update_execution_row_with_results(
         
         resp.raise_for_status()
         logger.info(f"   ✓ Updated execution row {execution_page_id} → {status}")
-        print(f"   ✓ Updated execution row {execution_page_id} → {status}")
+        if number_of_turns is not None:
+            logger.info(f"     • Number of Turns: {number_of_turns}")
+            print(f"   ✓ Updated execution row → {status} (Turns: {number_of_turns})")
+        else:
+            print(f"   ✓ Updated execution row → {status}")
         
     except Exception as e:
         log_exception(logger, e, "update_execution_row_with_results")
@@ -282,16 +300,51 @@ def get_pending_executions(db_id: str) -> List[Dict[str, Any]]:
 # PLAYWRIGHT RUNNER
 # =====================================
 
+def extract_turn_count_from_output(output: str) -> Optional[int]:
+    """
+    Extract number of turns from the bridge script output.
+    Looks for patterns like "Number of turns: 5" or "Completed 5 turns"
+    """
+    logger.debug("Extracting turn count from output")
+    
+    # Try pattern: "Number of turns: X"
+    match = re.search(r"Number of turns:\s*(\d+)", output, re.IGNORECASE)
+    if match:
+        turns = int(match.group(1))
+        logger.debug(f"  Found turn count via 'Number of turns': {turns}")
+        return turns
+    
+    # Try pattern: "Completed X turns"
+    match = re.search(r"Completed\s+(\d+)\s+turns", output, re.IGNORECASE)
+    if match:
+        turns = int(match.group(1))
+        logger.debug(f"  Found turn count via 'Completed X turns': {turns}")
+        return turns
+    
+    # Try pattern: "Total turns: X"
+    match = re.search(r"Total turns:\s*(\d+)", output, re.IGNORECASE)
+    if match:
+        turns = int(match.group(1))
+        logger.debug(f"  Found turn count via 'Total turns': {turns}")
+        return turns
+    
+    logger.debug("  No turn count found in output")
+    return None
+
+
 def run_playwright_bridge(
     test_case_name: str = "",
     persona: str = "",
     test_case_details: str = "",
     test_case_prompt: str = "",
-) -> str:
+) -> Tuple[str, Optional[int]]:
     """
     Run playwright_bridge_bot.py as a subprocess and capture stdout as conversation transcript.
     Passes test case parameters as command-line arguments.
-    Returns the captured text (may be empty on error).
+    
+    Returns: (conversation_text, number_of_turns)
+    
+    NEW: Extracts number of turns from the script output.
     """
     logger.info(f"Running Playwright bridge script: {BRIDGE_SCRIPT}")
     logger.debug(f"  Test case: {test_case_name}")
@@ -340,13 +393,23 @@ def run_playwright_bridge(
             logger.warning("No stdout captured from bridge script")
 
         logger.debug(f"Captured conversation: {len(conversation_text)} chars")
-        return conversation_text
+        
+        # ✅ Extract turn count from output
+        number_of_turns = extract_turn_count_from_output(conversation_text)
+        if number_of_turns is not None:
+            logger.info(f"✓ Extracted turn count: {number_of_turns}")
+            print(f"   ✓ Extracted turn count: {number_of_turns}")
+        else:
+            logger.warning("⚠️ Could not extract turn count from output")
+            print("   ⚠️ Could not extract turn count from output")
+        
+        return conversation_text, number_of_turns
         
     except Exception as e:
         log_exception(logger, e, "run_playwright_bridge")
         logger.error(f"   ❌ Error running bridge script: {e}")
         print(f"   ❌ Error running bridge script: {e}")
-        return f"(Bridge error: {e})"
+        return f"(Bridge error: {e})", None
 
 
 # =====================================
@@ -454,11 +517,8 @@ def main():
             logger.warning(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
             print(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
 
-        # Prepare env for Streamlit tester via Playwright (if you want to feed it)
-        # No longer needed here - we pass directly to run_playwright_bridge()
-
         start_ts = time.monotonic()
-        conversation_text = run_playwright_bridge(
+        conversation_text, number_of_turns = run_playwright_bridge(
             test_case_name=test_case_name,
             persona=persona,
             test_case_details=test_case_details,
@@ -468,6 +528,10 @@ def main():
 
         logger.info(f"   ⏱ Execution duration: {duration:.1f} seconds")
         print(f"   ⏱ Execution duration: {duration:.1f} seconds")
+        
+        if number_of_turns is not None:
+            logger.info(f"   🔄 Number of turns: {number_of_turns}")
+            print(f"   🔄 Number of turns: {number_of_turns}")
 
         # Create conversation page under Conversations parent
         # NOW USING THE IMPROVED FORMATTER!
@@ -480,12 +544,13 @@ def main():
             conversation_text=conversation_text,
         )
 
-        # Update execution row
+        # Update execution row with turn count
         update_execution_row_with_results(
             execution_page_id=page_id,
             status="Test Executed",
             duration_seconds=duration,
             conversation_page_id=conv_page_id,
+            number_of_turns=number_of_turns,  # ✅ Pass turn count
         )
 
     logger.info("\n" + "=" * 80)
