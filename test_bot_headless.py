@@ -2,10 +2,14 @@
 """
 Headless testing bot that replaces the Streamlit app.
 Can be run via HTTP server for Playwright to interact with.
+
+MODIFICATIONS:
+- Replaces {{max_turns}} placeholder in prompt
+- Returns should_continue flag from JSON response
 """
 import os
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
@@ -22,10 +26,12 @@ logger = setup_logging("test_bot_headless")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+MAX_TURNS = os.getenv("MAX_TURNS", "10")  # ✅ Load MAX_TURNS
 
 logger.info("✓ Test Bot Headless Service Starting")
 logger.info(f"OpenAI Model: {OPENAI_MODEL}")
 logger.info(f"OpenAI API Key: {'✓ Set' if OPENAI_API_KEY else '✗ Missing'}")
+logger.info(f"MAX_TURNS: {MAX_TURNS}")
 
 try:
     from openai import OpenAI
@@ -66,18 +72,27 @@ class TestBotSession:
             logger.error("Test case prompt is required but missing")
             raise RuntimeError("Test case prompt is required")
         
+        # Get MAX_TURNS from environment
+        max_turns = os.getenv("MAX_TURNS", "10")
+        
         prompt = (
             self.test_case_prompt
             .replace("{{test_case}}", self.test_case)
             .replace("{{persona}}", self.persona)
             .replace("{{test_case_details}}", self.test_case_details)
+            .replace("{{max_turns}}", max_turns)  # ✅ ADD MAX_TURNS
         )
         
         logger.debug(f"System prompt length: {len(prompt)} chars")
+        logger.debug(f"MAX_TURNS: {max_turns}")
         return prompt
     
-    def parse_json_response(self, reply: str) -> tuple[str, Optional[int]]:
-        """Parse JSON response from AI"""
+    def parse_json_response(self, reply: str) -> Tuple[str, Optional[int], bool]:
+        """
+        Parse JSON response from AI.
+        
+        Returns: (message, score, should_continue)
+        """
         logger.debug(f"Parsing JSON response ({len(reply)} chars)")
         
         try:
@@ -93,37 +108,42 @@ class TestBotSession:
             data = json.loads(clean_reply)
             message = data.get("message", "")
             score = data.get("completeness_score")
+            should_continue = data.get("should_continue", True)  # ✅ Extract should_continue
             
             if score is not None:
                 score = int(score)
                 score = max(1, min(100, score))
             
-            logger.debug(f"Parsed: message={len(message)} chars, score={score}")
-            return message, score
+            logger.debug(f"Parsed: message={len(message)} chars, score={score}, should_continue={should_continue}")
+            return message, score, should_continue
             
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.warning(f"JSON parse failed, returning raw reply: {e}")
-            return reply, None
+            return reply, None, True  # ✅ Default to continue on parse error
     
-    def get_response(self, user_message: str) -> tuple[str, Optional[int]]:
-        """Get AI response for user message"""
+    def get_response(self, user_message: str) -> Tuple[str, Optional[int], bool]:
+        """
+        Get AI response for user message.
+        
+        Returns: (reply, score, should_continue)
+        """
         turn_number = len(self.chat_history) + 1
         logger.info(f"Getting AI response (turn {turn_number})")
         logger.debug(f"User message: {user_message[:100]}...")
         
         if openai_client is None:
             logger.error("OPENAI_API_KEY not configured")
-            return "❌ OPENAI_API_KEY not configured", None
+            return "❌ OPENAI_API_KEY not configured", None, False
         
         if not OPENAI_MODEL:
             logger.error("OPENAI_MODEL not set")
-            return "❌ OPENAI_MODEL not set", None
+            return "❌ OPENAI_MODEL not set", None, False
         
         try:
             system_prompt = self.build_system_prompt()
         except Exception as e:
             log_exception(logger, e, "build_system_prompt")
-            return f"❌ System prompt error: {e}", None
+            return f"❌ System prompt error: {e}", None, False
         
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_prompt}
@@ -150,7 +170,7 @@ class TestBotSession:
             logger.debug(f"OpenAI response received in {duration:.2f}s")
             
             reply = resp.choices[0].message.content
-            message, score = self.parse_json_response(reply)
+            message, score, should_continue = self.parse_json_response(reply)
             
             # Save to history
             self.chat_history.append({
@@ -160,17 +180,17 @@ class TestBotSession:
             
             if score is not None:
                 self.score_history.append(score)
-                logger.info(f"✓ Response received with score: {score}/100")
+                logger.info(f"✓ Response received with score: {score}/100, should_continue: {should_continue}")
             else:
-                logger.info(f"✓ Response received (no score)")
+                logger.info(f"✓ Response received (no score), should_continue: {should_continue}")
             
             logger.debug(f"Message preview: {message[:100]}...")
-            return message, score
+            return message, score, should_continue
         
         except Exception as e:
             log_exception(logger, e, "OpenAI API call")
             logger.error(f"❌ OpenAI error: {e}")
-            return f"❌ OpenAI error: {e}", None
+            return f"❌ OpenAI error: {e}", None, False
 
 
 # Global session storage
@@ -334,7 +354,7 @@ class TestBotHandler(BaseHTTPRequestHandler):
                 return
             
             session = active_sessions[session_id]
-            reply, score = session.get_response(user_message)
+            reply, score, should_continue = session.get_response(user_message)
             
             logger.info(f"✓ Message processed (turn {len(session.chat_history)})")
             
@@ -344,6 +364,7 @@ class TestBotHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({
                 "reply": reply,
                 "score": score,
+                "should_continue": should_continue,  # ✅ Return should_continue
                 "turn": len(session.chat_history)
             }).encode())
         
@@ -370,11 +391,13 @@ def run_server(port: int = 8501):
     logger.info(f"OpenAI Model: {OPENAI_MODEL}")
     logger.info(f"OpenAI API Key: {'✓ Set' if OPENAI_API_KEY else '✗ Missing'}")
     logger.info(f"OpenAI Available: {OPENAI_AVAILABLE}")
+    logger.info(f"MAX_TURNS: {MAX_TURNS}")
     logger.info("=" * 80)
     
     print(f"🧪 Test Bot Server running on http://0.0.0.0:{port}")
     print(f"   OpenAI Model: {OPENAI_MODEL}")
     print(f"   OpenAI API Key: {'✓ Set' if OPENAI_API_KEY else '✗ Missing'}")
+    print(f"   MAX_TURNS: {MAX_TURNS}")
     
     server = HTTPServer(('0.0.0.0', port), TestBotHandler)
     

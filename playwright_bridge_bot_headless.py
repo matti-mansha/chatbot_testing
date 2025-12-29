@@ -136,8 +136,12 @@ def create_tester_session() -> Optional[str]:
         return None
 
 
-def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int]]]:
-    """Send message to tester bot via HTTP API. Returns (reply, score)"""
+def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int], bool]]:
+    """
+    Send message to tester bot via HTTP API.
+    
+    Returns: (reply, score, should_continue) or None on error
+    """
     if not tester_session_id:
         logger.error("❌ No active tester session")
         print("❌ No active tester session")
@@ -162,11 +166,14 @@ def send_to_tester_api(message: str) -> Optional[Tuple[str, Optional[int]]]:
         data = response.json()
         reply = data.get("reply", "")
         score = data.get("score")
+        should_continue = data.get("should_continue", True)  # ✅ Extract should_continue
         
-        logger.info(f"✓ Received reply from tester API (score: {score})")
+        logger.info(f"✓ Received reply from tester API")
+        logger.debug(f"  Score: {score}")
+        logger.debug(f"  Should continue: {should_continue}")
         logger.debug(f"  Reply: {reply[:100]}...")
         
-        return reply, score
+        return reply, score, should_continue
         
     except Exception as e:
         log_exception(logger, e, "send_to_tester_api")
@@ -708,6 +715,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
         # ===== MAIN LOOP =====
         logger.info(f"Starting main conversation loop (max {MAX_TURNS} turns)")
         early_exit = False
+        early_exit_reason = ""
         
         for turn in range(1, MAX_TURNS + 1):
             logger.info("=" * 60)
@@ -723,7 +731,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 print("❌ Tester API failed")
                 break
             
-            tester_reply, score = result
+            tester_reply, score, should_continue = result
             
             # Format reply with score if available
             if score is not None:
@@ -737,18 +745,28 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                     score_badge = f"🔴 **Completeness: {score}/100**"
                 
                 display_reply = f"{tester_reply}\n\n---\n{score_badge}"
-                logger.info(f"🧪 Tester reply with score {score}/100 ({len(tester_reply)} chars)")
+                logger.info(f"🧪 Tester reply with score {score}/100, should_continue={should_continue}")
                 
-                # ✅ CHECK FOR EARLY EXIT (score >= 85)
+                # ✅ CHECK FOR EARLY EXIT CONDITIONS
+                # Condition 1: High score (>= 85)
                 if score >= 85:
                     logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 85")
-                    logger.info("✨ Exiting early - test case completed successfully!")
-                    print(f"\n🎯 HIGH SCORE DETECTED: {score}/100 >= 85")
-                    print("✨ Exiting early - test case completed successfully!\n")
                     early_exit = True
+                    early_exit_reason = f"High score ({score}/100)"
+                
+                # ✅ Condition 2: should_continue=false AND score >= 80
+                if not should_continue and score >= 80:
+                    logger.info(f"✅ COMPLETION SIGNAL: should_continue=false AND score={score}/100 >= 80")
+                    early_exit = True
+                    early_exit_reason = f"Completion signal (score={score}/100, should_continue=false)"
+                
+                if early_exit:
+                    logger.info(f"✨ Exiting early - {early_exit_reason}")
+                    print(f"\n✨ EARLY EXIT: {early_exit_reason}")
+                    print(f"✅ Test case completed successfully!\n")
             else:
                 display_reply = tester_reply
-                logger.info(f"🧪 Tester reply without score ({len(tester_reply)} chars)")
+                logger.info(f"🧪 Tester reply without score, should_continue={should_continue}")
             
             logger.debug(f"   Reply: {tester_reply[:100]}...")
             print(f"🧪 Tester reply:\n{display_reply}\n")
@@ -757,10 +775,10 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             # Increment turn counter (one full turn = Mila → Tester → Mila)
             turns_completed = turn
             
-            # Exit early if score is high enough
+            # Exit early if conditions met
             if early_exit:
-                logger.info(f"✅ Completed {turns_completed} turns (early exit on high score)")
-                print(f"✅ Completed {turns_completed} turns (early exit on high score)")
+                logger.info(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
+                print(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
                 break
 
             # Tester → Mila
