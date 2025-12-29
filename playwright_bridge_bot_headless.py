@@ -5,7 +5,7 @@ Uses HTTP API instead of Streamlit for the tester bot.
 
 MODIFICATIONS:
 - Tracks number of turns
-- Breaks loop early if completeness score >= 85
+- Breaks loop early if completeness score >= 90
 """
 import os
 import time
@@ -615,7 +615,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     
     NEW FEATURES:
     - Tracks actual number of turns completed
-    - Exits early if completeness score >= 85
+    - Exits early if completeness score >= 90
     """
     global CONVERSATION_LOG
     CONVERSATION_LOG = []
@@ -749,8 +749,8 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 
                 # ✅ CHECK FOR EARLY EXIT CONDITIONS
                 # Condition 1: High score (>= 85)
-                if score >= 85:
-                    logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 85")
+                if score >= 90:
+                    logger.info(f"🎯 HIGH SCORE DETECTED: {score}/100 >= 90")
                     early_exit = True
                     early_exit_reason = f"High score ({score}/100)"
                 
