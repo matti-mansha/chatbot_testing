@@ -124,8 +124,14 @@ def extract_property_value(page: Dict[str, Any], property_name: str) -> Any:
             lst = prop.get("title", [])
             return lst[0]["plain_text"] if lst else ""
         elif prop_type == "rich_text":
+            # ✅ FIX: Concatenate ALL chunks, not just the first one
             lst = prop.get("rich_text", [])
-            return lst[0]["plain_text"] if lst else ""
+            if not lst:
+                return ""
+            # Concatenate all rich_text chunks
+            full_text = "".join(item.get("plain_text", "") for item in lst)
+            logger.debug(f"Extracted rich_text '{property_name}': {len(full_text)} chars from {len(lst)} chunks")
+            return full_text
         elif prop_type == "number":
             return prop.get("number")
         elif prop_type == "select":
@@ -486,9 +492,13 @@ def main():
         logger.info(f"   Test case name: {test_case_name}")
         logger.info(f"   Persona: {persona}")
         logger.info(f"   Test run number: {run_number}")
+        logger.info(f"   📝 Test case prompt length: {len(test_case_prompt)} chars")
+        logger.info(f"   📋 Test case details length: {len(test_case_details)} chars")
         print(f"   Test case name: {test_case_name}")
         print(f"   Persona: {persona}")
         print(f"   Test run number: {run_number}")
+        print(f"   📝 Prompt: {len(test_case_prompt)} chars")
+        print(f"   📋 Details: {len(test_case_details)} chars")
 
         # Mark as "Test Execustion Started" BEFORE running bridge (if such status exists)
         try:
