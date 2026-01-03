@@ -421,6 +421,68 @@ def find_test_run_by_number(db_id: str, test_run_number: str) -> Optional[Dict[s
         return None
 
 
+# def update_test_run_statistics(
+#     test_runs_db_id: str,
+#     test_run_number: str,
+#     evaluation_score: float,
+#     passed: bool
+# ):
+#     """Update Test Run statistics based on evaluation result."""
+#     if not test_runs_db_id or not test_run_number:
+#         logger.debug("⚠️ Test Runs DB ID or test run number missing, skipping statistics update")
+#         return
+    
+#     # Extract just the Test Run prefix (e.g., "TR2" from "TR2.TC16.1")
+#     test_run_prefix = test_run_number.split(".")[0] if "." in test_run_number else test_run_number
+#     logger.debug(f"   📊 Updating Test Run '{test_run_prefix}' (from execution '{test_run_number}')")
+    
+#     # Find the Test Run page
+#     test_run_page = find_test_run_by_number(test_runs_db_id, test_run_prefix)
+#     if not test_run_page:
+#         logger.warning(f"⚠️ Test Run '{test_run_prefix}' not found in Test Runs database")
+#         return
+    
+#     test_run_id = test_run_page.get("id")
+    
+#     # Extract current values
+#     succeeded = extract_property_value(test_run_page, "Number of test cases succeeded") or 0
+#     failed = extract_property_value(test_run_page, "Number of test cases failed") or 0
+#     current_score = extract_property_value(test_run_page, "Score") or 0
+    
+#     # Calculate new values
+#     if passed:
+#         new_succeeded = int(succeeded) + 1
+#         new_failed = int(failed)
+#     else:
+#         new_succeeded = int(succeeded)
+#         new_failed = int(failed) + 1
+    
+#     # Calculate new average score
+#     completed_count = int(succeeded) + int(failed)
+#     total_score = current_score * completed_count if completed_count > 0 else 0
+#     new_average = (total_score + evaluation_score) / (completed_count + 1)
+    
+#     # Update the Test Run page
+#     properties = {
+#         "Number of test cases succeeded": {"number": new_succeeded},
+#         "Number of test cases failed": {"number": new_failed},
+#         "Score": {"number": round(new_average, 2)}
+#     }
+    
+#     try:
+#         resp = httpx.patch(
+#             f"{NOTION_API_BASE}/pages/{test_run_id}",
+#             headers=HEADERS,
+#             json={"properties": properties},
+#             timeout=30.0,
+#         )
+#         resp.raise_for_status()
+#         logger.info(f"   ✅ Updated Test Run '{test_run_prefix}':")
+#         logger.info(f"      Succeeded: {succeeded} → {new_succeeded}")
+#         logger.info(f"      Failed: {failed} → {new_failed}")
+#         logger.info(f"      Average Score: {current_score:.2f} → {new_average:.2f}")
+#     except Exception as e:
+#         logger.error(f"❌ Error updating Test Run statistics: {e}")
 def update_test_run_statistics(
     test_runs_db_id: str,
     test_run_number: str,
@@ -445,27 +507,17 @@ def update_test_run_statistics(
     test_run_id = test_run_page.get("id")
     
     # Extract current values
-    succeeded = extract_property_value(test_run_page, "Number of test cases succeeded") or 0
-    failed = extract_property_value(test_run_page, "Number of test cases failed") or 0
     current_score = extract_property_value(test_run_page, "Score") or 0
-    
-    # Calculate new values
-    if passed:
-        new_succeeded = int(succeeded) + 1
-        new_failed = int(failed)
-    else:
-        new_succeeded = int(succeeded)
-        new_failed = int(failed) + 1
+    evaluation_count = extract_property_value(test_run_page, "Number of evaluations") or 0
     
     # Calculate new average score
-    completed_count = int(succeeded) + int(failed)
-    total_score = current_score * completed_count if completed_count > 0 else 0
-    new_average = (total_score + evaluation_score) / (completed_count + 1)
+    total_score = current_score * evaluation_count if evaluation_count > 0 else 0
+    new_evaluation_count = evaluation_count + 1
+    new_average = (total_score + evaluation_score) / new_evaluation_count
     
     # Update the Test Run page
     properties = {
-        "Number of test cases succeeded": {"number": new_succeeded},
-        "Number of test cases failed": {"number": new_failed},
+        "Number of evaluations": {"number": new_evaluation_count},
         "Score": {"number": round(new_average, 2)}
     }
     
@@ -478,8 +530,7 @@ def update_test_run_statistics(
         )
         resp.raise_for_status()
         logger.info(f"   ✅ Updated Test Run '{test_run_prefix}':")
-        logger.info(f"      Succeeded: {succeeded} → {new_succeeded}")
-        logger.info(f"      Failed: {failed} → {new_failed}")
+        logger.info(f"      Evaluations: {evaluation_count} → {new_evaluation_count}")
         logger.info(f"      Average Score: {current_score:.2f} → {new_average:.2f}")
     except Exception as e:
         logger.error(f"❌ Error updating Test Run statistics: {e}")
