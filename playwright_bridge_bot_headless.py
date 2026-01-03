@@ -10,6 +10,7 @@ IMPROVEMENTS:
 - Health check before creating session
 - Automatic session cleanup
 - Better error handling and recovery
+- FIXED: Proper bubble counting to avoid capturing old messages
 """
 import os
 import time
@@ -402,14 +403,50 @@ def get_mila_last_message_text(page: Page, selector: str, retry_count: int = 3) 
 
 
 def wait_for_new_message(page: Page, selector: str, previous_count: int, timeout_ms=30000):
-    """Wait for a new message to appear"""
-    end = time.time() + timeout_ms / 1000
-    while time.time() < end:
-        current = len(page.query_selector_all(selector))
-        if current > previous_count:
-            return current
-        time.sleep(0.2)
-    raise PlaywrightTimeoutError("No new message in time.")
+    """
+    Wait for a NEW message bubble to appear (bubble count must INCREASE).
+    
+    Args:
+        page: Playwright page
+        selector: CSS selector for message bubbles  
+        previous_count: Number of bubbles BEFORE sending the message
+        timeout_ms: Timeout in milliseconds
+        
+    Returns:
+        int: New bubble count
+        
+    Raises:
+        PlaywrightTimeoutError: If no new bubble appears within timeout
+    """
+    logger.debug(f"Waiting for new message bubble (previous count: {previous_count}, timeout: {timeout_ms}ms)")
+    print(f"⏳ Waiting for new message bubble (current: {previous_count})...")
+    
+    end_time = time.time() + (timeout_ms / 1000)
+    last_logged_count = previous_count
+    
+    # Wait a moment for UI to settle after message send
+    time.sleep(0.5)
+    
+    while time.time() < end_time:
+        current_count = len(page.query_selector_all(selector))
+        
+        # Log if count changes (for debugging)
+        if current_count != last_logged_count:
+            logger.debug(f"  Bubble count changed: {last_logged_count} → {current_count}")
+            last_logged_count = current_count
+        
+        # New bubble appeared!
+        if current_count > previous_count:
+            logger.info(f"✓ New message bubble appeared (count: {previous_count} → {current_count})")
+            print(f"✓ New message bubble appeared! (was {previous_count}, now {current_count})")
+            return current_count
+        
+        time.sleep(0.3)
+    
+    # Timeout - no new bubble appeared
+    final_count = len(page.query_selector_all(selector))
+    logger.error(f"❌ Timeout waiting for new bubble (expected > {previous_count}, got {final_count})")
+    raise PlaywrightTimeoutError(f"No new message bubble appeared in {timeout_ms}ms (count stayed at {final_count})")
 
 
 def dismiss_cookie_banner(page: Page):
@@ -743,6 +780,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     - Exits early if completeness score >= 90
     - Retry logic on failures
     - Automatic session cleanup
+    - FIXED: Proper bubble counting to avoid capturing old messages
     """
     global CONVERSATION_LOG
     CONVERSATION_LOG = []
@@ -817,18 +855,29 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             mila_sel = SELECTORS["mila"]["message_bubbles"]
 
             # ===== FIRST MILA MESSAGE =====
+            # ✅ FIX: Get the actual bubble count, don't assume 0
             initial_mila_count = len(page_mila.query_selector_all(mila_sel))
             logger.info(f"⏳ Waiting for Mila's first message... (current bubbles: {initial_mila_count})")
             print(f"⏳ Waiting for Mila's first message... (bubbles: {initial_mila_count})")
+            
+            # If greeting is already there (count >= 1), just wait for typing to complete
+            # If not (count == 0), wait for new bubble
+            if initial_mila_count == 0:
+                try:
+                    wait_for_new_message(page_mila, mila_sel, previous_count=0, timeout_ms=30000)
+                except PlaywrightTimeoutError:
+                    logger.error("❌ Mila didn't send first message (timeout)")
+                    print("❌ Mila didn't send first message")
+                    browser.close()
+                    return CONVERSATION_LOG, turns_completed
+            
+            # Always wait for typing to complete
             try:
-                wait_for_new_message(page_mila, mila_sel, previous_count=0, timeout_ms=30000)
                 wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=30000)
-            except PlaywrightTimeoutError:
-                logger.error("❌ Mila didn't send first message (timeout)")
-                print("❌ Mila didn't send first message")
-                browser.close()
-                return CONVERSATION_LOG, turns_completed
+            except Exception as e:
+                logger.warning(f"⚠️ Error waiting for typing: {e}")
 
+            # Get the first message
             mila_count = len(page_mila.query_selector_all(mila_sel))
             mila_last = get_mila_last_message_text(page_mila, mila_sel)
             
@@ -912,6 +961,10 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                     print(f"✅ Completed {turns_completed} turns (early exit: {early_exit_reason})")
                     break
 
+                # ✅ FIX: Count bubbles BEFORE sending message
+                mila_count_before_send = len(page_mila.query_selector_all(mila_sel))
+                logger.debug(f"Mila bubbles before sending: {mila_count_before_send}")
+                
                 # Tester → Mila
                 logger.debug(f"Sending tester's reply to Mila ({len(tester_reply)} chars)")
                 try:
@@ -922,10 +975,11 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                     print(f"❌ Failed to send to Mila: {e}")
                     break
 
-                logger.debug("Waiting for Mila's response...")
+                # ✅ FIX: Wait for NEW bubble to appear (comparing to count BEFORE send)
+                logger.debug(f"Waiting for Mila's response (expecting count > {mila_count_before_send})...")
                 try:
                     new_mila_count = wait_for_new_message(
-                        page_mila, mila_sel, mila_count, timeout_ms=45000
+                        page_mila, mila_sel, mila_count_before_send, timeout_ms=45000
                     )
                     wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=60000)
                 except PlaywrightTimeoutError:
@@ -933,7 +987,10 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                     print("❌ Mila did not reply")
                     break
 
+                # Update bubble count
                 mila_count = new_mila_count
+                
+                # Get Mila's reply
                 mila_last = get_mila_last_message_text(page_mila, mila_sel)
                 
                 if not mila_last:
