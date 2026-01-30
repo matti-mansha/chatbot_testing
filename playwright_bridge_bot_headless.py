@@ -9,6 +9,7 @@ ENHANCEMENTS:
 - Step-by-step message exchange logging
 - Network activity tracking
 - Screenshot capture on errors (optional)
+- Full diagnostic capture system
 """
 import os
 import time
@@ -16,7 +17,7 @@ import pathlib
 import sys
 import httpx
 from typing import Optional, List, Dict, Tuple
-
+from diagnostic_utils import DiagnosticCapture
 from playwright.sync_api import (
     sync_playwright,
     Page,
@@ -508,6 +509,66 @@ def wait_for_mila_typing_complete(page: Page, selector: str, timeout_ms: int = 6
     logger.warning(f"  Checks performed: {check_count}")
     logger.warning("=" * 60)
     print("⚠️ Typing wait timeout, proceeding anyway...")
+
+def handle_mila_technical_error(page: Page, max_wait_ms: int = 2000) -> bool:
+    """
+    Check for technical errors and automatically click retry button.
+    Returns True if retry button was clicked, False otherwise.
+    """
+    logger.debug("Checking for technical error state...")
+    
+    try:
+        # Wait a moment for error to appear
+        page.wait_for_timeout(max_wait_ms)
+        
+        # Look for error message
+        error_found = False
+        error_selectors = [
+            "text='I am sorry, something went terribly wrong'",
+            "text='Please try to ask me again'",
+        ]
+        
+        for selector in error_selectors:
+            try:
+                if page.locator(selector).first.is_visible(timeout=1000):
+                    error_found = True
+                    logger.info(f"✓ Detected technical error message")
+                    print(f"⚠️ Technical error detected in Mila response")
+                    break
+            except:
+                continue
+        
+        if not error_found:
+            logger.debug("  No error message detected")
+            return False
+        
+        # Look for retry button
+        retry_selectors = [
+            "button:has-text('Retry last instruction')",
+            "button:has-text('Retry')",
+            "button:has-text('Try again')",
+        ]
+        
+        for selector in retry_selectors:
+            try:
+                retry_btn = page.locator(selector).first
+                if retry_btn.is_visible(timeout=2000):
+                    logger.info(f"🔄 Found retry button: {selector}")
+                    print(f"🔄 Clicking Retry button...")
+                    retry_btn.click()
+                    page.wait_for_timeout(1500)
+                    logger.info("✓ Clicked retry button")
+                    return True
+            except Exception as e:
+                logger.debug(f"  Retry selector failed: {e}")
+                continue
+        
+        logger.warning("⚠️ Error detected but no retry button found")
+        return False
+        
+    except Exception as e:
+        logger.debug(f"Error check failed: {e}")
+        return False
 
 
 def get_mila_last_message_text(page: Page, selector: str, retry_count: int = 3) -> Optional[str]:
@@ -1079,13 +1140,17 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
 
 def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     """
-    Run the headless bridge with extensive logging.
+    Run the headless bridge with extensive logging and diagnostics.
     Returns: (conversation_log, number_of_turns)
     """
     global CONVERSATION_LOG
     CONVERSATION_LOG = []
     
     turns_completed = 0
+
+    # ✨ Initialize diagnostics
+    diagnostics = DiagnosticCapture(output_dir="diagnostics")
+    logger.info("✓ Diagnostics system initialized")
 
     logger.info("=" * 80)
     logger.info("STARTING HEADLESS BRIDGE BOT")
@@ -1152,6 +1217,11 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             logger.debug("Creating browser context")
             context_mila = browser.new_context(**ctx_kwargs_mila)
             page_mila = context_mila.new_page()
+
+            # ✨ Setup diagnostic listeners
+            diagnostics.setup_listeners(page_mila)
+            logger.info("✓ Diagnostic listeners activated")
+            
             logger.info("✓ Browser context created")
 
             # Navigate to Mila
@@ -1167,6 +1237,9 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             logger.info(f"✓ Page loaded in {nav_time:.2f}s")
             log_page_state(page_mila, "after_navigation")
             logger.info("=" * 60)
+            
+            # ✨ Capture initial state
+            diagnostics.capture_dom_snapshot(page_mila, "01_page_loaded")
             take_screenshot(page_mila, "page_loaded")
 
             # Setup steps
@@ -1174,7 +1247,15 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             perform_mila_login(page_mila)
             page_mila.wait_for_timeout(2000)
             open_mila_chat(page_mila)
+            
+            # ✨ Capture after opening chat
+            diagnostics.capture_dom_snapshot(page_mila, "02_chat_opened")
+            diagnostics.detect_all_chat_elements(page_mila, "after_chat_open")
+            
             clear_mila_history(page_mila)
+            
+            # ✨ Capture after clearing history
+            diagnostics.capture_dom_snapshot(page_mila, "03_history_cleared")
 
             mila_sel = SELECTORS["mila"]["message_bubbles"]
 
@@ -1193,6 +1274,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 except PlaywrightTimeoutError:
                     logger.error("❌ Mila didn't send first message (timeout)")
                     print("❌ Mila didn't send first message")
+                    diagnostics.capture_dom_snapshot(page_mila, "04_first_message_timeout_ERROR")
                     take_screenshot(page_mila, "first_message_timeout")
                     browser.close()
                     return CONVERSATION_LOG, turns_completed
@@ -1208,6 +1290,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             if not mila_last:
                 logger.error("❌ Failed to extract Mila's first message")
                 print("❌ Failed to extract Mila's first message")
+                diagnostics.capture_dom_snapshot(page_mila, "05_first_message_extraction_ERROR")
                 take_screenshot(page_mila, "first_message_extraction_failed")
                 browser.close()
                 return CONVERSATION_LOG, turns_completed
@@ -1217,6 +1300,10 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             logger.info(f"  Content: {mila_last[:200]}...")
             print(f"🟠 Mila first message:\n{mila_last}\n")
             CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
+            
+            # ✨ Capture first message state
+            diagnostics.capture_dom_snapshot(page_mila, "06_first_message_received")
+            diagnostics.detect_all_chat_elements(page_mila, "first_message")
             take_screenshot(page_mila, "first_message_received")
 
             # ===== MAIN LOOP =====
@@ -1287,12 +1374,54 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 mila_count_before_send = len(page_mila.query_selector_all(mila_sel))
                 logger.info(f"Bubble count before send: {mila_count_before_send}")
                 
+                # ✨ Capture state before sending
+                diagnostics.detect_all_chat_elements(page_mila, f"turn{turn}_before_send")
+                
                 try:
                     send_message_to_mila(page_mila, tester_reply)
+                    
+                    # ✨ Capture state after sending
+                    diagnostics.capture_dom_snapshot(page_mila, f"07_turn{turn}_message_sent")
+                    
+                    # ✨✨ NEW: Auto-retry loop for technical errors
+                    retry_attempts = 0
+                    max_auto_retries = 2
+                    
+                    while retry_attempts < max_auto_retries:
+                        # Check for technical error and auto-retry
+                        if handle_mila_technical_error(page_mila, max_wait_ms=2000):
+                            retry_attempts += 1
+                            logger.info(f"🔄 Auto-retry {retry_attempts}/{max_auto_retries}")
+                            print(f"🔄 Auto-retry attempt {retry_attempts}/{max_auto_retries}...")
+                            
+                            # Capture retry state
+                            diagnostics.capture_dom_snapshot(page_mila, 
+                                f"07_turn{turn}_retry_{retry_attempts}")
+                            
+                            # Wait for retry to process
+                            page_mila.wait_for_timeout(3000)
+                        else:
+                            # No error detected, proceed
+                            logger.debug("✓ No technical error detected")
+                            break
+                    
+                    # Check if error persists after all retries
+                    if retry_attempts >= max_auto_retries:
+                        logger.error("❌ Technical error persists after max retries")
+                        error_state = diagnostics.check_for_errors(page_mila)
+                        if error_state["has_errors"]:
+                            logger.error(f"   Error: {error_state['error_messages']}")
+                            diagnostics.capture_dom_snapshot(page_mila, 
+                                f"08_turn{turn}_ERROR_PERSISTENT")
+                            take_screenshot(page_mila, f"persistent_error_turn{turn}")
+                            print(f"❌ Persistent error after {max_auto_retries} retries")
+                            break
+                        
                 except Exception as e:
                     log_exception(logger, e, "send_message_to_mila")
                     logger.error(f"❌ Failed to send to Mila: {e}")
                     print(f"❌ Failed to send to Mila: {e}")
+                    diagnostics.capture_dom_snapshot(page_mila, f"09_turn{turn}_send_FAILED")
                     take_screenshot(page_mila, f"send_failed_turn{turn}")
                     break
 
@@ -1305,6 +1434,18 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 except PlaywrightTimeoutError:
                     logger.error("❌ Mila did not reply (timeout)")
                     print("❌ Mila did not reply")
+                    
+                    # ✨ Capture timeout state for analysis
+                    diagnostics.capture_dom_snapshot(page_mila, f"10_turn{turn}_TIMEOUT")
+                    diagnostics.detect_all_chat_elements(page_mila, f"turn{turn}_timeout")
+                    
+                    # ✨ Check if there are error messages
+                    error_state = diagnostics.check_for_errors(page_mila)
+                    if error_state["has_errors"]:
+                        logger.error(f"❌ Errors found during timeout!")
+                        logger.error(f"   Error types: {error_state['error_types']}")
+                        logger.error(f"   Error messages: {error_state['error_messages']}")
+                    
                     take_screenshot(page_mila, f"mila_timeout_turn{turn}")
                     break
 
@@ -1314,6 +1455,7 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 if not mila_last:
                     logger.error("❌ Failed to extract Mila's reply")
                     print("❌ Failed to extract Mila's reply")
+                    diagnostics.capture_dom_snapshot(page_mila, f"11_turn{turn}_extraction_FAILED")
                     take_screenshot(page_mila, f"extraction_failed_turn{turn}")
                     break
                 
@@ -1322,6 +1464,10 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 logger.info(f"  Content: {mila_last[:200]}...")
                 print(f"🟠 Mila reply:\n{mila_last}\n")
                 CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
+                
+                # ✨ Capture successful turn completion
+                diagnostics.capture_dom_snapshot(page_mila, f"12_turn{turn}_complete")
+                diagnostics.detect_all_chat_elements(page_mila, f"turn{turn}_complete")
                 take_screenshot(page_mila, f"turn{turn}_complete")
 
             logger.info("=" * 80)
@@ -1341,6 +1487,16 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
 
     finally:
         cleanup_tester_session()
+        
+        # ✨ Always save diagnostics
+        try:
+            logger.info("Saving diagnostics...")
+            diagnostics.save_diagnostics()
+            logger.info("✓ Diagnostics saved successfully")
+            print("✓ Diagnostics saved")
+        except Exception as e:
+            logger.error(f"Failed to save diagnostics: {e}")
+            print(f"⚠️ Failed to save diagnostics: {e}")
 
     logger.info(f"Returning: {len(CONVERSATION_LOG)} entries, {turns_completed} turns")
     return CONVERSATION_LOG, turns_completed
