@@ -351,8 +351,17 @@ def run_playwright_bridge(
     logger.debug(f"  Details length: {len(test_case_details)} chars")
     logger.debug(f"  Prompt length: {len(test_case_prompt)} chars")
     
+    # ✅ FIX: Use virtual environment Python
+    python_path = BASE_DIR / "env" / "bin" / "python"
+    if not python_path.exists():
+        python_path = "python3"
+        logger.warning("Virtual environment Python not found, using system python3")
+    else:
+        python_path = str(python_path)
+        logger.debug(f"Using virtual environment Python: {python_path}")
+    
     cmd = [
-        "python", 
+        python_path,  # ✅ NOW USES VENV PYTHON
         BRIDGE_SCRIPT,
         test_case_name or "",
         persona or "",
