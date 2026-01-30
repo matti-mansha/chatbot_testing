@@ -357,7 +357,12 @@ def get_all_test_cases() -> List[Dict[str, Any]]:
     try:
         while True:
             page_num += 1
-            body = {}
+            body = {
+                "filter": {
+                    "property": "Status",
+                    "status": {"equals": "Active"}
+                }
+            }
             if cursor:
                 body["start_cursor"] = cursor
             
