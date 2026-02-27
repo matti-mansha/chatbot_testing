@@ -177,9 +177,10 @@ SELECTORS = {
     "mila": {
         "message_bubbles": ".message-bubble.ai-message.ai-message-text",
         "input_selectors": [
+            "#text-input[contenteditable='true']",
+            "[contenteditable='true']",
             "input[placeholder='Enter a prompt here']",
             "textarea[placeholder='Enter a prompt here']",
-            "[contenteditable='true']",
             "div.ai-deepchat--input-container input",
             "div.ai-deepchat--input-container textarea",
             "textarea.ai-deepchat--textarea",
@@ -188,12 +189,24 @@ SELECTORS = {
             "div[class*='deepchat'] textarea",
         ],
         "send_button": (
+            "div.submit-button-enlarged, "
+            "[role='button'].submit-button-enlarged, "
             "button.ai-deepchat--send, "
             "button[aria-label='Send'], "
             "button:has-text('Send')"
         ),
-        "header": "div.ai-deepchat--header",
-        "clear_history": "a.clear-history, a[class*='clear-history'], a.chat-dropdown-link",
+        # Chat widget structure selectors
+        "chat_header": "div.chat-header",
+        "fab_button": "div.fab-mode",
+        "header_mode": "div.header-mode",
+        "close_button": "span.js-chat-toggle, span.toggle-icon",
+        # Legacy header selector (kept for backward compatibility)
+        "header": "div.chat-header",
+        # Reset/clear chat
+        "reset_chat": "div.reset-chat",
+        "clear_history": "div.reset-chat, a.clear-history, a[class*='clear-history'], a.chat-dropdown-link",
+        # Menu (kebab icon in header)
+        "menu_opener": "qz-dropdown qz-icon[slot='opener']",
     }
 }
 
@@ -822,6 +835,12 @@ def perform_mila_login(page: Page):
         login_btn = page.get_by_role("button", name="Log in")
         login_btn.click()
 
+        # Wait for page to settle after login (navigation + async loading)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+            logger.debug("  Network idle after login")
+        except Exception:
+            logger.debug("  Network idle timeout, continuing...")
         page.wait_for_timeout(2000)
         logger.info("✓ Login attempt complete")
         logger.info("=" * 60)
@@ -838,33 +857,66 @@ def perform_mila_login(page: Page):
 
 
 def open_mila_chat(page: Page):
-    """Open Mila chat widget"""
+    """Open Mila chat widget by clicking the FAB button if chat is collapsed"""
     logger.info("=" * 60)
     logger.info("OPENING MILA CHAT WIDGET")
     logger.info("=" * 60)
-    
+
     try:
-        logger.debug(f"Looking for header: {SELECTORS['mila']['header']}")
-        header = page.locator(SELECTORS["mila"]["header"]).first
-        header.wait_for(state="visible", timeout=10000)
-        logger.debug("  Header found")
-        
-        aria_expanded = header.get_attribute("aria-expanded")
-        logger.debug(f"  aria-expanded: {aria_expanded}")
-        
-        if aria_expanded == "false":
-            logger.info("💬 Chat widget closed, opening...")
-            print("💬 Opening Mila chat widget...")
-            header.click()
-            page.wait_for_timeout(800)
-            logger.info("✓ Chat widget opened")
-        else:
-            logger.info("💬 Chat widget already open")
-            print("💬 Mila chat widget already open.")
-        
+        # Check if the chat is already in expanded (header-mode) state
+        header_mode = page.locator(SELECTORS["mila"]["header_mode"]).first
+        try:
+            if header_mode.is_visible(timeout=3000):
+                logger.info("💬 Chat widget already open (header-mode visible)")
+                print("💬 Mila chat widget already open.")
+                logger.info("=" * 60)
+                take_screenshot(page, "chat_already_open")
+                return
+        except Exception:
+            pass
+
+        # Chat is collapsed - look for the FAB button to open it
+        logger.debug(f"Looking for FAB button: {SELECTORS['mila']['fab_button']}")
+        fab = page.locator(SELECTORS["mila"]["fab_button"]).first
+
+        try:
+            fab.wait_for(state="visible", timeout=10000)
+            logger.info("💬 Chat widget collapsed, clicking FAB to open...")
+            print("💬 Opening Mila chat widget via FAB button...")
+            fab.click()
+            page.wait_for_timeout(1000)
+
+            # Verify it opened
+            try:
+                header_mode.wait_for(state="visible", timeout=5000)
+                logger.info("✓ Chat widget opened successfully")
+            except Exception:
+                logger.warning("⚠️ FAB clicked but header-mode not visible yet, continuing anyway")
+
+            logger.info("=" * 60)
+            take_screenshot(page, "chat_opened")
+            return
+        except Exception as e:
+            logger.debug(f"FAB button not found or not visible: {e}")
+
+        # Fallback: try legacy header selector with aria-expanded
+        logger.debug("Trying legacy header approach...")
+        header = page.locator("div.ai-deepchat--header").first
+        try:
+            header.wait_for(state="visible", timeout=3000)
+            aria_expanded = header.get_attribute("aria-expanded")
+            if aria_expanded == "false":
+                header.click()
+                page.wait_for_timeout(800)
+                logger.info("✓ Chat widget opened via legacy header")
+            else:
+                logger.info("💬 Chat widget already open (legacy)")
+        except Exception:
+            logger.debug("Legacy header not found either")
+
         logger.info("=" * 60)
         take_screenshot(page, "chat_opened")
-        
+
     except Exception as e:
         log_exception(logger, e, "open_mila_chat")
         logger.warning("=" * 60)
@@ -872,17 +924,24 @@ def open_mila_chat(page: Page):
 
 
 def clear_mila_history(page: Page):
-    """Clear Mila chat history"""
+    """Clear Mila chat history using 'Reset chat' from the kebab menu"""
     logger.info("=" * 60)
     logger.info("CLEARING MILA CHAT HISTORY")
     logger.info("=" * 60)
-    
+
     try:
         print("🗑️  Clearing Mila chat history...")
-        
-        # Open menu
+
+        # Step 1: Open the kebab menu (three-dot icon) in the header
         menu_opened = False
+
+        # Primary: use the qz-dropdown opener in header-mode
         menu_selectors = [
+            SELECTORS["mila"]["menu_opener"],          # qz-dropdown qz-icon[slot='opener']
+            "div.header-mode qz-icon[slot='opener']",  # more specific
+            "qz-icon[name='more-vertical']",           # by icon name
+            "div.header-mode qz-dropdown",             # the dropdown itself
+            # Legacy fallbacks
             "svg.chevron-icon",
             "svg#chevron",
             "button[aria-label*='menu']",
@@ -890,9 +949,8 @@ def clear_mila_history(page: Page):
             ".ai-deepchat--header svg",
             ".ai-deepchat--header button",
             "[class*='menu-icon']",
-            "[class*='dropdown']",
         ]
-        
+
         logger.debug("Looking for menu button")
         for menu_sel in menu_selectors:
             try:
@@ -909,60 +967,65 @@ def clear_mila_history(page: Page):
             except Exception as e:
                 logger.debug(f"  Selector failed: {e}")
                 continue
-        
+
         if not menu_opened:
             logger.warning("⚠️ Could not find menu button, trying direct access")
             print("   ⚠️ Could not find menu button, trying direct access...")
-        
-        # Find Clear History button
+
+        # Step 2: Click "Reset chat" (new name) or "Clear History" (legacy)
         clear_selectors = [
+            SELECTORS["mila"]["reset_chat"],           # div.reset-chat
+            "div.reset-chat span",                     # the span inside reset-chat
+            ":has-text('Reset chat')",                 # text match
             "a.clear-history",
             "a[class*='clear-history']",
             "a.chat-dropdown-link:has-text('Clear History')",
             "a:has-text('Clear History')",
             "button:has-text('Clear History')",
         ]
-        
+
         clicked = False
-        logger.debug("Looking for Clear History button")
+        logger.debug("Looking for Reset chat / Clear History button")
         for clear_sel in clear_selectors:
             try:
                 logger.debug(f"  Trying selector: {clear_sel}")
                 clear_btn = page.locator(clear_sel).first
                 if clear_btn.is_visible(timeout=2000):
-                    logger.info(f"✓ Found Clear History: {clear_sel}")
-                    print(f"   Found Clear History with selector: {clear_sel}")
+                    logger.info(f"✓ Found Reset/Clear button: {clear_sel}")
+                    print(f"   Found Reset/Clear with selector: {clear_sel}")
                     clear_btn.click()
-                    logger.info("✓ Clicked 'Clear History'")
-                    print("   ✓ Clicked 'Clear History'")
+                    logger.info("✓ Clicked 'Reset chat'")
+                    print("   ✓ Clicked 'Reset chat'")
                     page.wait_for_timeout(1500)
                     clicked = True
-                    logger.debug("  Waiting for confirmation dialog")
                     break
             except Exception as e:
                 logger.debug(f"  Selector failed: {e}")
                 continue
-        
+
         if not clicked:
-            try:
-                logger.debug("Trying text match for Clear History")
-                clear_link = page.get_by_text("Clear History", exact=False)
-                if clear_link.is_visible(timeout=2000):
-                    clear_link.click()
-                    logger.info("✓ Clicked via text match")
-                    print("   ✓ Clicked 'Clear History' using text match")
-                    page.wait_for_timeout(1500)
-                    clicked = True
-            except Exception as e:
-                logger.debug(f"  Text match failed: {e}")
-        
+            # Try text match as last resort
+            for text_label in ["Reset chat", "Clear History"]:
+                try:
+                    logger.debug(f"Trying text match for '{text_label}'")
+                    text_link = page.get_by_text(text_label, exact=False)
+                    if text_link.is_visible(timeout=2000):
+                        text_link.click()
+                        logger.info(f"✓ Clicked via text match: '{text_label}'")
+                        print(f"   ✓ Clicked '{text_label}' using text match")
+                        page.wait_for_timeout(1500)
+                        clicked = True
+                        break
+                except Exception as e:
+                    logger.debug(f"  Text match failed: {e}")
+
         if not clicked:
-            logger.error("❌ Could not find 'Clear History' button")
-            print("   ⚠️ Could not find 'Clear History' button")
+            logger.error("❌ Could not find 'Reset chat' or 'Clear History' button")
+            print("   ⚠️ Could not find 'Reset chat' or 'Clear History' button")
             logger.info("=" * 60)
             return
-        
-        # Confirm clearing
+
+        # Step 3: Confirm clearing if a confirmation dialog appears
         try:
             logger.debug("Looking for confirmation button")
             confirm_selectors = [
@@ -970,8 +1033,9 @@ def clear_mila_history(page: Page):
                 "button:has-text('Yes')",
                 "button:has-text('OK')",
                 "button:has-text('Clear')",
+                "button:has-text('Reset')",
             ]
-            
+
             for confirm_sel in confirm_selectors:
                 try:
                     logger.debug(f"  Trying: {confirm_sel}")
@@ -987,12 +1051,12 @@ def clear_mila_history(page: Page):
                     continue
         except Exception as e:
             logger.debug(f"Confirmation handling: {e}")
-        
+
         logger.info("✓ History cleared successfully")
         print("   ✓ History cleared successfully")
         logger.info("=" * 60)
         take_screenshot(page, "history_cleared")
-        
+
     except Exception as e:
         log_exception(logger, e, "clear_mila_history")
         logger.error("=" * 60)
@@ -1000,21 +1064,44 @@ def clear_mila_history(page: Page):
 
 
 def ensure_mila_chat_open(page: Page):
-    """Ensure Mila chat is open"""
+    """Ensure Mila chat is open - click FAB button if collapsed"""
     logger.debug("Ensuring Mila chat is open")
-    
+
     try:
-        header = page.locator(SELECTORS["mila"]["header"]).first
-        if header.is_visible():
-            aria_expanded = header.get_attribute("aria-expanded")
-            if aria_expanded == "false":
-                logger.info("💬 Reopening chat widget")
+        # Check if chat is collapsed (FAB mode visible)
+        fab = page.locator(SELECTORS["mila"]["fab_button"]).first
+        try:
+            if fab.is_visible(timeout=2000):
+                logger.info("💬 Chat collapsed, reopening via FAB button")
                 print("💬 Reopening Mila chat widget...")
-                header.click()
-                page.wait_for_timeout(800)
-        
-        # Scroll to bottom
+                fab.click()
+                page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        # Legacy fallback: check header with aria-expanded
+        try:
+            header = page.locator("div.ai-deepchat--header").first
+            if header.is_visible(timeout=1000):
+                aria_expanded = header.get_attribute("aria-expanded")
+                if aria_expanded == "false":
+                    logger.info("💬 Reopening chat widget (legacy)")
+                    header.click()
+                    page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+        # Scroll chat to bottom - try shadow DOM message container first
         page.evaluate("""
+            // Try deep-chat shadow DOM first
+            const deepChat = document.querySelector('deep-chat');
+            if (deepChat && deepChat.shadowRoot) {
+                const messages = deepChat.shadowRoot.querySelector('#messages');
+                if (messages) {
+                    messages.scrollTop = messages.scrollHeight;
+                }
+            }
+            // Fallback: try regular DOM selectors
             const chatContainer = document.querySelector('div.ai-deepchat--body, div[class*="chat-messages"]');
             if (chatContainer) {
                 chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -1084,8 +1171,13 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
                 box.evaluate(f"""
                     (element) => {{
                         if (element.contentEditable === 'true') {{
+                            // Clear existing content
+                            element.innerHTML = '';
                             element.textContent = {repr(text)};
-                            element.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            // Fire multiple events to ensure deep-chat picks up the change
+                            element.dispatchEvent(new Event('input', {{ bubbles: true, composed: true }}));
+                            element.dispatchEvent(new Event('change', {{ bubbles: true, composed: true }}));
+                            element.dispatchEvent(new KeyboardEvent('keyup', {{ bubbles: true, composed: true }}));
                         }} else {{
                             element.value = {repr(text)};
                             element.dispatchEvent(new Event('input', {{ bubbles: true }}));
@@ -1096,7 +1188,11 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
                 logger.debug("  JavaScript fill successful")
             except Exception as e:
                 logger.warning(f"  JavaScript fill failed: {e}, trying keyboard")
-                box.fill("")
+                try:
+                    box.fill("")
+                except Exception:
+                    pass
+                box.click()
                 page.keyboard.type(text, delay=0)
                 logger.debug("  Keyboard fill successful")
 
@@ -1108,9 +1204,13 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
                 logger.debug("  Send button visible, clicking")
                 btn.click()
             except PlaywrightTimeoutError:
-                logger.warning("  Send button not visible, pressing Enter")
+                logger.warning("  Send button not visible, trying Enter key")
                 try:
+                    # Focus the input first, then press Enter
+                    box.click()
+                    page.wait_for_timeout(200)
                     page.keyboard.press("Enter")
+                    logger.debug("  Enter key pressed")
                 except Exception as e:
                     logger.error(f"  Failed to press Enter: {e}")
             
