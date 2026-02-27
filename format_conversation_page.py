@@ -35,6 +35,101 @@ HEADERS = {
 # CONVERSATION PARSER
 # =====================================
 
+# System / status emoji prefixes to skip during message collection
+_SYSTEM_EMOJI_PREFIXES = (
+    '⏳', '✓', '➡️', '⚠️', '❌', '📝', '🔐', '🔓', '💬', '🗑️',
+    '✅', '✨', '📊', '🔄', '🚨', '🧹', 'ℹ️', '🎯',
+)
+
+# Lines matching these patterns mark the end of conversation content
+_POST_CONVERSATION_PATTERNS = [
+    'Chat loop finished',
+    'TEST COMPLETED',
+    'Diagnostics saved',
+    'Summary:',
+    'MAX RESTARTS EXCEEDED',
+    'Test failed to complete',
+    'Unexpected error',
+    'RESTARTING ENTIRE TEST',
+    'Conversation entries:',
+    'Number of turns:',
+]
+
+
+def _extract_score(message_text: str):
+    """Extract completeness score from message text and return (cleaned_text, score)."""
+    score_match = re.search(r'[🟢🟡🟠🔴]\s*\*\*Completeness:\s*(\d+)/100\*\*', message_text)
+    if score_match:
+        score = int(score_match.group(1))
+        cleaned = re.sub(
+            r'\n*---\s*\n*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$',
+            '', message_text, flags=re.MULTILINE
+        ).strip()
+        return cleaned, score
+    return message_text, None
+
+
+def _is_noise_line(line: str) -> bool:
+    """Return True if the line is system noise that should be skipped."""
+    stripped = line.strip()
+    if not stripped:
+        return False  # blank lines are OK inside messages
+    # Pure separator lines (5+ equals signs with nothing else)
+    if re.match(r'^[=\-]{5,}\s*$', stripped):
+        return True
+    # System emoji prefixes
+    if stripped.startswith(_SYSTEM_EMOJI_PREFIXES):
+        return True
+    # Post-conversation markers
+    if any(pat in stripped for pat in _POST_CONVERSATION_PATTERNS):
+        return True
+    # Turn count lines like "Turns: 5", "Restart attempts: 0"
+    if re.match(r'^\s*(Turns|Restart attempts|Completed \d+ turns)', stripped):
+        return True
+    return False
+
+
+def _save_message(current_speaker, current_message_lines, current_turn, turns):
+    """Flush the current message into the current turn. Returns updated (current_turn, turns)."""
+    if not current_speaker or not current_message_lines:
+        return current_turn, turns
+
+    message_text = '\n'.join(current_message_lines).strip()
+    if not message_text or message_text == 'None':
+        return current_turn, turns
+
+    message_text, score = _extract_score(message_text)
+
+    if current_turn is None:
+        current_turn = {'turn_number': 0, 'messages': []}
+
+    current_turn['messages'].append({
+        'speaker': current_speaker,
+        'text': message_text,
+        'score': score,
+    })
+    return current_turn, turns
+
+
+def _is_turn_marker(line: str):
+    """
+    Detect turn markers in two formats:
+      1) Single-line:  "========== TURN 3/10 =========="
+      2) Standalone:   "TURN 3/10"  (with ===== on surrounding lines)
+    Returns the turn number (int) or None.
+    """
+    stripped = line.strip()
+    # Format 1: equals signs + TURN on same line
+    m = re.match(r'=+\s*TURN\s+(\d+)(?:/\d+)?\s*=*$', stripped)
+    if m:
+        return int(m.group(1))
+    # Format 2: standalone "TURN N" or "TURN N/M"
+    m = re.match(r'^TURN\s+(\d+)(?:/\d+)?$', stripped)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def parse_conversation_transcript(text: str) -> Dict[str, Any]:
     """
     Parse the conversation transcript into structured sections.
@@ -42,156 +137,95 @@ def parse_conversation_transcript(text: str) -> Dict[str, Any]:
     """
     logger.debug(f"Parsing conversation transcript ({len(text)} chars)")
     lines = text.split('\n')
-    
-    # Extract metadata (everything before first turn)
-    metadata_lines = []
-    conversation_start_idx = 0
-    
+
+    # ---- find conversation boundaries ----
+    # Start: first speaker marker or first TURN marker
+    conv_start = 0
     for i, line in enumerate(lines):
-        if '========== TURN' in line:
-            conversation_start_idx = i
+        if line.startswith('🟠 Mila') or _is_turn_marker(line) is not None:
+            conv_start = i
             break
-        metadata_lines.append(line)
-    
-    logger.debug(f"Found {len(metadata_lines)} metadata lines, conversation starts at line {conversation_start_idx}")
-    
-    # Parse turns
-    turns = []
+
+    # End: first post-conversation marker after conversation starts
+    conv_end = len(lines)
+    for i in range(conv_start, len(lines)):
+        stripped = lines[i].strip()
+        if 'Chat loop finished' in stripped or 'TEST COMPLETED' in stripped:
+            conv_end = i
+            break
+
+    metadata_text = '\n'.join(lines[:conv_start]).strip()
+    conv_lines = lines[conv_start:conv_end]
+
+    logger.debug(f"Conversation boundaries: lines {conv_start}-{conv_end} "
+                 f"({len(conv_lines)} lines), metadata {conv_start} lines")
+
+    # ---- parse turns ----
+    turns: List[Dict[str, Any]] = []
     current_turn = None
     current_speaker = None
-    current_message_lines = []
-    
-    for line in lines[conversation_start_idx:]:
+    current_message_lines: List[str] = []
+
+    for line in conv_lines:
         # Turn marker
-        turn_match = re.match(r'=+\s*TURN\s+(\d+)\s*=+', line)
-        if turn_match:
-            # Save previous message if exists
-            if current_speaker and current_message_lines:
-                # Initialize turn if needed (for conversations without turn markers)
-                if current_turn is None:
-                    current_turn = {'turn_number': 0, 'messages': []}
-                
-                # Parse the message and extract score if present
-                message_text = '\n'.join(current_message_lines).strip()
-                score = None
-                
-                # Extract completeness score if present (format: "🟢 **Completeness: 90/100**")
-                score_match = re.search(r'[🟢🟡🟠🔴]\s*\*\*Completeness:\s*(\d+)/100\*\*', message_text)
-                if score_match:
-                    score = int(score_match.group(1))
-                    # Remove the score line from message text for cleaner display
-                    message_text = re.sub(r'---\s*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$', '', message_text, flags=re.MULTILINE).strip()
-                
-                current_turn['messages'].append({
-                    'speaker': current_speaker,
-                    'text': message_text,
-                    'score': score
-                })
-                current_message_lines = []
-                current_speaker = None
-            
-            # Save previous turn if exists
+        turn_number = _is_turn_marker(line)
+        if turn_number is not None:
+            current_turn, turns = _save_message(
+                current_speaker, current_message_lines, current_turn, turns)
+            current_message_lines = []
+            current_speaker = None
+
+            # Save previous turn
             if current_turn:
                 turns.append(current_turn)
-            
-            # Start new turn
-            turn_number = int(turn_match.group(1))
-            current_turn = {
-                'turn_number': turn_number,
-                'messages': []
-            }
+
+            current_turn = {'turn_number': turn_number, 'messages': []}
             logger.debug(f"Starting turn {turn_number}")
             continue
-        
+
         # Speaker markers
         if line.startswith('🟠 Mila'):
-            # Save previous message if exists
-            if current_speaker and current_message_lines:
-                message_text = '\n'.join(current_message_lines).strip()
-                score = None
-                
-                # Extract completeness score if present
-                score_match = re.search(r'[🟢🟡🟠🔴]\s*\*\*Completeness:\s*(\d+)/100\*\*', message_text)
-                if score_match:
-                    score = int(score_match.group(1))
-                    message_text = re.sub(r'---\s*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$', '', message_text, flags=re.MULTILINE).strip()
-                
-                # Initialize turn if needed (for conversations without turn markers)
-                if current_turn is None:
-                    current_turn = {'turn_number': 0, 'messages': []}
-                
-                current_turn['messages'].append({
-                    'speaker': current_speaker,
-                    'text': message_text,
-                    'score': score
-                })
-                current_message_lines = []
-            
+            current_turn, turns = _save_message(
+                current_speaker, current_message_lines, current_turn, turns)
+            current_message_lines = []
             current_speaker = 'Mila'
             continue
-        
+
         if line.startswith('🧪 Tester'):
-            # Save previous message if exists
-            if current_speaker and current_message_lines:
-                message_text = '\n'.join(current_message_lines).strip()
-                score = None
-                
-                # Extract completeness score if present
-                score_match = re.search(r'[🟢🟡🟠🔴]\s*\*\*Completeness:\s*(\d+)/100\*\*', message_text)
-                if score_match:
-                    score = int(score_match.group(1))
-                    message_text = re.sub(r'---\s*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$', '', message_text, flags=re.MULTILINE).strip()
-                
-                # Initialize turn if needed (for conversations without turn markers)
-                if current_turn is None:
-                    current_turn = {'turn_number': 0, 'messages': []}
-                
-                current_turn['messages'].append({
-                    'speaker': current_speaker,
-                    'text': message_text,
-                    'score': score
-                })
-                current_message_lines = []
-            
+            current_turn, turns = _save_message(
+                current_speaker, current_message_lines, current_turn, turns)
+            current_message_lines = []
             current_speaker = 'Tester'
             continue
-        
-        # System messages (skip these for main content)
-        if line.startswith(('⏳', '✓', '➡️', '⚠️', '❌', '📝', '🔐', '🔓', '💬', '🗑️')):
+
+        # Skip system / noise lines
+        if _is_noise_line(line):
             continue
-        
-        # Regular message content
+
+        # Collect message content
         if current_speaker:
             current_message_lines.append(line)
-    
-    # Save final message and turn
-    if current_speaker and current_message_lines:
-        # Initialize turn if needed (for conversations without turn markers)
-        if current_turn is None:
-            current_turn = {'turn_number': 0, 'messages': []}
-        
-        message_text = '\n'.join(current_message_lines).strip()
-        score = None
-        
-        # Extract completeness score if present
-        score_match = re.search(r'[🟢🟡🟠🔴]\s*\*\*Completeness:\s*(\d+)/100\*\*', message_text)
-        if score_match:
-            score = int(score_match.group(1))
-            message_text = re.sub(r'---\s*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$', '', message_text, flags=re.MULTILINE).strip()
-        
-        current_turn['messages'].append({
-            'speaker': current_speaker,
-            'text': message_text,
-            'score': score
-        })
+
+    # Flush final message & turn
+    current_turn, turns = _save_message(
+        current_speaker, current_message_lines, current_turn, turns)
     if current_turn:
         turns.append(current_turn)
-    
+
+    # ---- fold Turn 0 into Turn 1 ----
+    # The opening Mila message lands in a synthetic Turn 0 because it appears
+    # before the first TURN marker. Merge it into Turn 1 for a cleaner layout.
+    if len(turns) >= 2 and turns[0]['turn_number'] == 0 and turns[1]['turn_number'] == 1:
+        turns[1]['messages'] = turns[0]['messages'] + turns[1]['messages']
+        turns.pop(0)
+    elif len(turns) == 1 and turns[0]['turn_number'] == 0:
+        turns[0]['turn_number'] = 1
+
     logger.info(f"Parsed {len(turns)} turns from conversation")
-    
+
     return {
-        'metadata': '\n'.join(metadata_lines).strip(),
-        'turns': turns
+        'metadata': metadata_text,
+        'turns': turns,
     }
 
 
@@ -292,223 +326,137 @@ def split_text_for_notion(text: str, max_length: int = 2000) -> List[str]:
 # IMPROVED CONVERSATION PAGE CREATOR
 # =====================================
 
+def _score_badge(score: int) -> tuple:
+    """Return (icon, label, notion_color) for a completeness score."""
+    if score >= 80:
+        return "🟢", "Excellent", "green_background"
+    if score >= 60:
+        return "🟡", "Good", "yellow_background"
+    if score >= 40:
+        return "🟠", "Fair", "orange_background"
+    return "🔴", "Needs Work", "red_background"
+
+
+def _build_turn_children(turn: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build the Notion child blocks for a single turn (inside a toggle)."""
+    children: List[Dict[str, Any]] = []
+
+    for msg in turn['messages']:
+        speaker = msg['speaker']
+        text = msg.get('text', '')
+        if not text or text == 'None':
+            continue
+
+        icon = "🤖" if speaker == 'Mila' else "🧪"
+        color = "blue_background" if speaker == 'Mila' else "green_background"
+
+        chunks = split_text_for_notion(text, max_length=1900)
+        children.append(create_callout_block(chunks[0], icon=icon, color=color))
+        for chunk in chunks[1:]:
+            children.append(create_paragraph_block(chunk))
+
+    return children
+
+
 def create_formatted_conversation_page(
     parent_page_id: str,
     title: str,
     conversation_text: str,
 ) -> Optional[str]:
     """
-    Create a beautifully formatted Notion page with the conversation transcript.
+    Create a formatted Notion page with the conversation transcript.
     Returns the created page ID or None on error.
     """
     logger.info(f"Creating formatted conversation page: {title}")
     logger.debug(f"Parent page: {parent_page_id}")
     logger.debug(f"Conversation length: {len(conversation_text)} chars")
-    
+
     if not conversation_text:
         conversation_text = "(No conversation captured)"
         logger.warning("Empty conversation text provided")
 
     parent_uuid = format_notion_id(parent_page_id)
-    
-    # Parse the conversation
     parsed = parse_conversation_transcript(conversation_text)
-    
-    # Build blocks
+
     blocks: List[Dict[str, Any]] = []
-    
-    # =====================================
-    # CLEAN METADATA SECTION - MODIFIED
-    # =====================================
-    if parsed['metadata']:
-        metadata_blocks = []
-        
-        # Define patterns to SKIP (technical noise)
-        skip_patterns = [
-            'DOM snapshot', 'Console Logs', 'Network Events',
-            'JavaScript Errors', 'UI State Snapshots', 'Message bubble',
-            'Error indicators', 'DIAGNOSTIC REPORT', '===',
-            'Session ID:', 'Generated:', 'Requests:', 'Responses:',
-            'Status Codes:', 'waiting for', 'Waiting for',
-            'Found menu', 'Found Clear', 'Clicked', 'clicking',
-            'filling', 'Filling', 'login', 'Login', 'cookie',
-            'Cookie', 'Saved', 'saved', 'diagnostics/',
-            'selector:', 'bubbles:', 'typing', 'complete_dom',
-            'sent_dom', 'health check', 'session:', 'API', 'api',
-            '.html', '.json', 'REPORT.txt', 'Opening', 'opening',
-            'Clearing', 'clearing', 'Creating', 'creating',
-            'Activated', 'activated', 'listeners', 'snapshot',
-            'Active sessions', 'OpenAI', 'model:', 'time:',
-            'Preview:', 'preview:', 'Length:', 'length:',
-            'attempt complete', 'send', 'Send', 'input',
-            'Input', 'bubble appeared', 'finished typing',
-            'new message', 'reply:', 'Tester API',
-            'Diagnostic', 'bytes', 'Bytes', 'Check #'
-        ]
-        
-        # Filter metadata to essential lines only
-        for line in parsed['metadata'].split('\n'):
-            line_stripped = line.strip()
-            if not line_stripped:
-                continue
-            
-            # Skip lines with technical patterns
-            if any(skip in line for skip in skip_patterns):
-                continue
-            
-            # Keep lines that look like important summary info
-            if any(keyword in line for keyword in [
-                'RESTART', 'TEST COMPLETED', 'Turns:', 'Restart attempts',
-                'Early exit', 'EARLY EXIT', 'score='
-            ]):
-                metadata_blocks.append(create_paragraph_block(line))
-        
-        # Add filtered metadata if we have any essential info
-        if metadata_blocks:
-            blocks.append(create_toggle_block("📋 Test Summary", metadata_blocks))
-            blocks.append(create_divider_block())
-            logger.debug(f"Added filtered metadata with {len(metadata_blocks)} essential lines")
-        else:
-            logger.debug("No essential metadata to display (all filtered out)")
-    
-    # =====================================
-    # END OF CLEAN METADATA SECTION
-    # =====================================
-    
-    # Add completeness score summary if scores are present
+
+    # ---- Completeness Score Summary (top of page) ----
     scores = []
     for turn in parsed['turns']:
         for msg in turn['messages']:
             if msg.get('score') is not None:
-                scores.append(msg['score'])
-    
+                scores.append((turn['turn_number'], msg['score']))
+
     if scores:
-        # Calculate statistics
-        final_score = scores[-1]
-        avg_score = sum(scores) / len(scores)
-        min_score = min(scores)
-        max_score = max(scores)
-        
-        logger.info(f"Score statistics: Final={final_score}, Avg={avg_score:.1f}, Min={min_score}, Max={max_score}")
-        
-        # Determine overall status
-        if final_score >= 80:
-            status_icon = "🟢"
-            status_text = "Excellent"
-            status_color = "green_background"
-        elif final_score >= 60:
-            status_icon = "🟡"
-            status_text = "Good"
-            status_color = "yellow_background"
-        elif final_score >= 40:
-            status_icon = "🟠"
-            status_text = "Fair"
-            status_color = "orange_background"
-        else:
-            status_icon = "🔴"
-            status_text = "Needs Work"
-            status_color = "red_background"
-        
-        # Add summary heading
-        blocks.append(create_heading_block("📊 Completeness Score Summary", level=2))
-        
-        # Add final score callout
-        final_score_text = f"{status_icon} Final Score: {final_score}/100 ({status_text})"
-        blocks.append(create_callout_block(final_score_text, icon="🎯", color=status_color))
-        
-        # Add statistics
-        stats_text = f"Average: {avg_score:.1f}/100  •  Min: {min_score}/100  •  Max: {max_score}/100  •  Total Turns: {len(scores)}"
-        blocks.append(create_paragraph_block(stats_text))
-        
-        # Add score progression if more than one score
-        if len(scores) > 1:
-            progression_text = "Score Progression: " + " → ".join([str(s) for s in scores])
-            blocks.append(create_paragraph_block(progression_text))
-        
+        score_values = [s for _, s in scores]
+        final_score = score_values[-1]
+        avg_score = sum(score_values) / len(score_values)
+
+        logger.info(f"Score statistics: Final={final_score}, Avg={avg_score:.1f}, "
+                     f"Min={min(score_values)}, Max={max(score_values)}")
+
+        s_icon, s_label, s_color = _score_badge(final_score)
+
+        blocks.append(create_heading_block("Completeness Score", level=2))
+        blocks.append(create_callout_block(
+            f"{s_icon}  Final Score: {final_score}/100  —  {s_label}",
+            icon="🎯", color=s_color,
+        ))
+
+        stats_parts = [
+            f"Avg {avg_score:.0f}",
+            f"Min {min(score_values)}",
+            f"Max {max(score_values)}",
+            f"{len(score_values)} turns scored",
+        ]
+        blocks.append(create_paragraph_block("  •  ".join(stats_parts)))
+
+        if len(score_values) > 1:
+            blocks.append(create_paragraph_block(
+                " → ".join(str(s) for s in score_values)
+            ))
+
         blocks.append(create_divider_block())
-    
-    # Add conversation turns
+
+    # ---- Conversation Turns (each as a toggle) ----
     logger.debug(f"Processing {len(parsed['turns'])} turns")
     for turn in parsed['turns']:
         turn_num = turn['turn_number']
-        
-        # Turn heading
-        blocks.append(create_heading_block(f"Turn {turn_num}", level=2))
-        
-        # Messages in this turn
+
+        # Build toggle title with score badge if available
+        turn_score = None
         for msg in turn['messages']:
-            speaker = msg['speaker']
-            text = msg['text']
-            score = msg.get('score')  # Extract score
-            
-            if not text or text == "None":
-                continue
-            
-            # Choose icon and color based on speaker
-            if speaker == 'Mila':
-                icon = "🤖"
-                color = "blue_background"
-            else:  # Tester
-                icon = "🧪"
-                color = "green_background"
-            
-            # Split long messages into multiple blocks
-            chunks = split_text_for_notion(text, max_length=1900)
-            
-            # First chunk as callout
-            blocks.append(create_callout_block(chunks[0], icon=icon, color=color))
-            
-            # Additional chunks as paragraphs
-            for chunk in chunks[1:]:
-                blocks.append(create_paragraph_block(chunk))
-            
-            # Add score indicator if present (only for Tester messages)
-            if score is not None and speaker == 'Tester':
-                # Determine color based on score
-                if score >= 80:
-                    score_icon = "🟢"
-                    score_color = "green_background"
-                    score_status = "Excellent"
-                elif score >= 60:
-                    score_icon = "🟡"
-                    score_color = "yellow_background"
-                    score_status = "Good"
-                elif score >= 40:
-                    score_icon = "🟠"
-                    score_color = "orange_background"
-                    score_status = "Fair"
-                else:
-                    score_icon = "🔴"
-                    score_color = "red_background"
-                    score_status = "Needs Work"
-                
-                # Add score callout
-                score_text = f"{score_icon} Completeness Score: {score}/100 ({score_status})"
-                blocks.append(create_callout_block(score_text, icon="📊", color=score_color))
-        
-        # Add divider after each turn (except the last one)
-        if turn != parsed['turns'][-1]:
-            blocks.append(create_divider_block())
-    
-    # If no turns were parsed, fall back to simple paragraph format
-    if not blocks or len(blocks) <= 2:  # Only metadata and divider
+            if msg.get('score') is not None:
+                turn_score = msg['score']
+        if turn_score is not None:
+            icon, label, _ = _score_badge(turn_score)
+            toggle_title = f"Turn {turn_num}  —  {icon} {turn_score}/100"
+        else:
+            toggle_title = f"Turn {turn_num}"
+
+        children = _build_turn_children(turn)
+        if not children:
+            continue
+
+        # Notion limits toggle children to 100
+        toggle_blocks = create_toggle_blocks_with_limit(toggle_title, children)
+        blocks.extend(toggle_blocks)
+
+    # ---- Fallback if nothing parsed ----
+    if not blocks:
         logger.warning("Could not parse conversation structure, using simple format")
-        print("⚠️ Could not parse conversation structure, using simple format...")
-        blocks = []
         paragraphs = conversation_text.split("\n\n")
         for para in paragraphs:
             para = para.strip()
             if not para:
                 continue
-            chunks = split_text_for_notion(para, max_length=1800)
-            for chunk in chunks:
+            for chunk in split_text_for_notion(para, max_length=1800):
                 blocks.append(create_paragraph_block(chunk))
-    
-    # Ensure we have at least one block
+
     if not blocks:
         blocks.append(create_paragraph_block("(Empty conversation)"))
         logger.warning("No blocks created, adding empty conversation message")
-    
+
     logger.debug(f"Created {len(blocks)} blocks for conversation page")
     
     # Create the page
