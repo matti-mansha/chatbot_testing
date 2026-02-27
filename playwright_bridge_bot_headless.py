@@ -10,6 +10,7 @@ ENHANCEMENTS:
 - Network activity tracking
 - Screenshot capture on errors (optional)
 - Full diagnostic capture system
+- COMPLETE RESTART STRATEGY: If retry button appears, restart entire test
 """
 import os
 import time
@@ -25,6 +26,22 @@ from playwright.sync_api import (
 )
 from dotenv import load_dotenv
 from logging_config import setup_logging, log_exception, log_api_call
+
+# =====================================
+# CUSTOM EXCEPTIONS
+# =====================================
+
+class TechnicalErrorDetected(Exception):
+    """Raised when Mila shows a technical error - signals COMPLETE TEST RESTART needed"""
+    pass
+
+
+class RestartTestRequired(Exception):
+    """Raised to signal that the entire test case should be restarted from scratch"""
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
 
 # =====================================
 # LOAD .env
@@ -49,6 +66,10 @@ DETAILED_TIMING = os.getenv("DETAILED_TIMING", "true").lower() == "true"
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5"))
 TESTER_API_TIMEOUT = float(os.getenv("TESTER_API_TIMEOUT", "120"))
+
+# ✅ NEW: Complete restart configuration
+MAX_TEST_RESTARTS = int(os.getenv("MAX_TEST_RESTARTS", "5"))  # Max times to restart entire test
+RESTART_DELAY = int(os.getenv("RESTART_DELAY", "10"))  # Seconds to wait before restarting
 
 # Mila web login credentials
 MILA_LOGIN_USER = os.getenv("MILA_LOGIN_USER", "").strip()
@@ -78,6 +99,8 @@ logger.info(f"  MAX_TURNS: {MAX_TURNS}")
 logger.info(f"  MAX_RETRIES: {MAX_RETRIES}")
 logger.info(f"  RETRY_DELAY: {RETRY_DELAY}s")
 logger.info(f"  TESTER_API_TIMEOUT: {TESTER_API_TIMEOUT}s")
+logger.info(f"  MAX_TEST_RESTARTS: {MAX_TEST_RESTARTS}")
+logger.info(f"  RESTART_DELAY: {RESTART_DELAY}s")
 logger.info(f"  Test Case: {TEST_CASE}")
 logger.info(f"  Persona: {TEST_PERSONA}")
 logger.info(f"  Screenshots: {ENABLE_SCREENSHOTS}")
@@ -510,66 +533,6 @@ def wait_for_mila_typing_complete(page: Page, selector: str, timeout_ms: int = 6
     logger.warning("=" * 60)
     print("⚠️ Typing wait timeout, proceeding anyway...")
 
-def handle_mila_technical_error(page: Page, max_wait_ms: int = 2000) -> bool:
-    """
-    Check for technical errors and automatically click retry button.
-    Returns True if retry button was clicked, False otherwise.
-    """
-    logger.debug("Checking for technical error state...")
-    
-    try:
-        # Wait a moment for error to appear
-        page.wait_for_timeout(max_wait_ms)
-        
-        # Look for error message
-        error_found = False
-        error_selectors = [
-            "text='I am sorry, something went terribly wrong'",
-            "text='Please try to ask me again'",
-        ]
-        
-        for selector in error_selectors:
-            try:
-                if page.locator(selector).first.is_visible(timeout=1000):
-                    error_found = True
-                    logger.info(f"✓ Detected technical error message")
-                    print(f"⚠️ Technical error detected in Mila response")
-                    break
-            except:
-                continue
-        
-        if not error_found:
-            logger.debug("  No error message detected")
-            return False
-        
-        # Look for retry button
-        retry_selectors = [
-            "button:has-text('Retry last instruction')",
-            "button:has-text('Retry')",
-            "button:has-text('Try again')",
-        ]
-        
-        for selector in retry_selectors:
-            try:
-                retry_btn = page.locator(selector).first
-                if retry_btn.is_visible(timeout=2000):
-                    logger.info(f"🔄 Found retry button: {selector}")
-                    print(f"🔄 Clicking Retry button...")
-                    retry_btn.click()
-                    page.wait_for_timeout(1500)
-                    logger.info("✓ Clicked retry button")
-                    return True
-            except Exception as e:
-                logger.debug(f"  Retry selector failed: {e}")
-                continue
-        
-        logger.warning("⚠️ Error detected but no retry button found")
-        return False
-        
-    except Exception as e:
-        logger.debug(f"Error check failed: {e}")
-        return False
-
 
 def get_mila_last_message_text(page: Page, selector: str, retry_count: int = 3) -> Optional[str]:
     """Get the last message text from Mila"""
@@ -662,6 +625,7 @@ def get_mila_last_message_text(page: Page, selector: str, retry_count: int = 3) 
 def wait_for_new_message(page: Page, selector: str, previous_count: int, timeout_ms=30000):
     """
     Wait for a NEW message bubble to appear (bubble count must INCREASE).
+    NOW WITH: Continuous error checking during the wait - RAISES RestartTestRequired if error found.
     """
     logger.info("=" * 60)
     logger.info("WAITING FOR NEW MESSAGE BUBBLE")
@@ -691,6 +655,49 @@ def wait_for_new_message(page: Page, selector: str, previous_count: int, timeout
             last_logged_count = current_count
         elif check_count % 10 == 0:  # Log every 10th check
             logger.debug(f"Check #{check_count} ({elapsed:.1f}s): Still waiting (count: {current_count})")
+        
+        # ✅✅✅ CRITICAL: Check for technical errors DURING the wait
+        # If error found, RAISE EXCEPTION TO RESTART ENTIRE TEST
+        if check_count % 3 == 0:  # Check every 3rd iteration
+            try:
+                # Quick check for error message (no long timeout)
+                # Use partial text matching with :has-text() for robustness
+                error_text_patterns = [
+                    "something went terribly wrong",
+                    "Please try to ask me again",
+                ]
+                
+                for pattern in error_text_patterns:
+                    try:
+                        # Use :has-text() for partial matching (more robust than exact text match)
+                        error_elem = page.locator(f":has-text('{pattern}')").first
+                        if error_elem.is_visible(timeout=100):
+                            logger.error(f"🚨 TECHNICAL ERROR DETECTED during wait (after {elapsed:.1f}s)")
+                            logger.error(f"   Pattern matched: '{pattern}'")
+                            logger.error(f"   ⚠️ INITIATING COMPLETE TEST RESTART")
+                            print(f"🚨 Technical error detected - RESTARTING ENTIRE TEST!")
+                            
+                            # Take screenshot of error
+                            take_screenshot(page, f"error_detected_restart_needed")
+                            
+                            # Raise exception to trigger complete restart
+                            raise RestartTestRequired(f"Technical error detected: '{pattern}' at {elapsed:.1f}s into wait")
+                            
+                    except PlaywrightTimeoutError:
+                        # Error selector not found, continue
+                        continue
+                    except RestartTestRequired:
+                        # Re-raise to propagate up
+                        raise
+                    except Exception as e:
+                        # Other errors, ignore and continue
+                        logger.debug(f"Error pattern '{pattern}' check failed: {e}")
+                        continue
+            except RestartTestRequired:
+                # Propagate to caller
+                raise
+            except Exception as e:
+                logger.debug(f"Error check exception: {e}")
         
         # New bubble appeared!
         if current_count > previous_count:
@@ -1138,9 +1145,10 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
 # MAIN BRIDGE FUNCTION
 # =====================================
 
-def run_bridge() -> Tuple[List[Dict[str, str]], int]:
+def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
     """
-    Run the headless bridge with extensive logging and diagnostics.
+    Run a SINGLE attempt of the headless bridge.
+    Raises RestartTestRequired if technical error detected.
     Returns: (conversation_log, number_of_turns)
     """
     global CONVERSATION_LOG
@@ -1153,25 +1161,9 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     logger.info("✓ Diagnostics system initialized")
 
     logger.info("=" * 80)
-    logger.info("STARTING HEADLESS BRIDGE BOT")
-    logger.info("=" * 80)
-    logger.info(f"Mila URL:           {MILA_URL}")
-    logger.info(f"Tester API URL:     {TESTER_API_URL}")
-    logger.info(f"Max turns:          {MAX_TURNS}")
-    logger.info(f"Max retries:        {MAX_RETRIES}")
-    logger.info(f"Retry delay:        {RETRY_DELAY}s")
-    logger.info(f"Screenshots:        {ENABLE_SCREENSHOTS}")
-    logger.info(f"Detailed timing:    {DETAILED_TIMING}")
+    logger.info("STARTING HEADLESS BRIDGE BOT - SINGLE ATTEMPT")
     logger.info("=" * 80)
     
-    print("\n" + "=" * 80)
-    print("Starting headless bridge bot...")
-    print(f"Mila URL:        {MILA_URL}")
-    print(f"Tester API URL:  {TESTER_API_URL}")
-    print(f"Max turns:       {MAX_TURNS}")
-    print(f"Max retries:     {MAX_RETRIES}")
-    print("=" * 80 + "\n")
-
     if not MILA_URL:
         logger.error("❌ Missing MILA_URL in .env")
         print("❌ Missing MILA_URL in .env")
@@ -1379,67 +1371,31 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                 
                 try:
                     send_message_to_mila(page_mila, tester_reply)
-                    
-                    # ✨ Capture state after sending
                     diagnostics.capture_dom_snapshot(page_mila, f"07_turn{turn}_message_sent")
                     
-                    # ✨✨ NEW: Auto-retry loop for technical errors
-                    retry_attempts = 0
-                    max_auto_retries = 2
-                    
-                    while retry_attempts < max_auto_retries:
-                        # Check for technical error and auto-retry
-                        if handle_mila_technical_error(page_mila, max_wait_ms=2000):
-                            retry_attempts += 1
-                            logger.info(f"🔄 Auto-retry {retry_attempts}/{max_auto_retries}")
-                            print(f"🔄 Auto-retry attempt {retry_attempts}/{max_auto_retries}...")
-                            
-                            # Capture retry state
-                            diagnostics.capture_dom_snapshot(page_mila, 
-                                f"07_turn{turn}_retry_{retry_attempts}")
-                            
-                            # Wait for retry to process
-                            page_mila.wait_for_timeout(3000)
-                        else:
-                            # No error detected, proceed
-                            logger.debug("✓ No technical error detected")
-                            break
-                    
-                    # Check if error persists after all retries
-                    if retry_attempts >= max_auto_retries:
-                        logger.error("❌ Technical error persists after max retries")
-                        error_state = diagnostics.check_for_errors(page_mila)
-                        if error_state["has_errors"]:
-                            logger.error(f"   Error: {error_state['error_messages']}")
-                            diagnostics.capture_dom_snapshot(page_mila, 
-                                f"08_turn{turn}_ERROR_PERSISTENT")
-                            take_screenshot(page_mila, f"persistent_error_turn{turn}")
-                            print(f"❌ Persistent error after {max_auto_retries} retries")
-                            break
-                        
-                except Exception as e:
-                    log_exception(logger, e, "send_message_to_mila")
-                    logger.error(f"❌ Failed to send to Mila: {e}")
-                    print(f"❌ Failed to send to Mila: {e}")
-                    diagnostics.capture_dom_snapshot(page_mila, f"09_turn{turn}_send_FAILED")
-                    take_screenshot(page_mila, f"send_failed_turn{turn}")
-                    break
-
-                # Wait for Mila's response
-                try:
+                    # ✅ NEW: Simple wait with error detection
+                    # If RestartTestRequired is raised, it propagates up
                     new_mila_count = wait_for_new_message(
                         page_mila, mila_sel, mila_count_before_send, timeout_ms=45000
                     )
                     wait_for_mila_typing_complete(page_mila, mila_sel, timeout_ms=60000)
-                except PlaywrightTimeoutError:
-                    logger.error("❌ Mila did not reply (timeout)")
-                    print("❌ Mila did not reply")
                     
-                    # ✨ Capture timeout state for analysis
+                    mila_count = new_mila_count
+                    logger.info("✓ Response received successfully")
+                        
+                except RestartTestRequired:
+                    # Error detected - propagate to trigger restart
+                    logger.error("🚨 RestartTestRequired raised - propagating up")
+                    raise
+                    
+                except PlaywrightTimeoutError:
+                    # Regular timeout (no error, just slow)
+                    logger.error("❌ Mila did not reply (timeout)")
+                    print("❌ Mila did not reply (timeout)")
+                    
                     diagnostics.capture_dom_snapshot(page_mila, f"10_turn{turn}_TIMEOUT")
                     diagnostics.detect_all_chat_elements(page_mila, f"turn{turn}_timeout")
                     
-                    # ✨ Check if there are error messages
                     error_state = diagnostics.check_for_errors(page_mila)
                     if error_state["has_errors"]:
                         logger.error(f"❌ Errors found during timeout!")
@@ -1448,8 +1404,16 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
                     
                     take_screenshot(page_mila, f"mila_timeout_turn{turn}")
                     break
+                        
+                except Exception as e:
+                    log_exception(logger, e, "send_message_to_mila or wait")
+                    logger.error(f"❌ Failed: {e}")
+                    print(f"❌ Failed: {e}")
+                    diagnostics.capture_dom_snapshot(page_mila, f"09_turn{turn}_FAILED")
+                    take_screenshot(page_mila, f"failed_turn{turn}")
+                    break
 
-                mila_count = new_mila_count
+                # Extract Mila's response
                 mila_last = get_mila_last_message_text(page_mila, mila_sel)
                 
                 if not mila_last:
@@ -1485,6 +1449,11 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
             browser.close()
             logger.info("✓ Browser closed")
 
+    except RestartTestRequired:
+        # Propagate to outer handler
+        logger.error("🚨 RestartTestRequired - cleaning up and propagating")
+        raise
+        
     finally:
         cleanup_tester_session()
         
@@ -1502,27 +1471,114 @@ def run_bridge() -> Tuple[List[Dict[str, str]], int]:
     return CONVERSATION_LOG, turns_completed
 
 
+def run_bridge_with_restart() -> Tuple[List[Dict[str, str]], int]:
+    """
+    Run the bridge with complete restart strategy.
+    If RestartTestRequired is raised, restart entire test from scratch.
+    Keep trying until success or max restarts reached.
+    """
+    restart_attempt = 0
+    
+    while restart_attempt <= MAX_TEST_RESTARTS:
+        try:
+            logger.info("=" * 100)
+            if restart_attempt == 0:
+                logger.info(f"STARTING TEST EXECUTION (Attempt 1/{MAX_TEST_RESTARTS + 1})")
+            else:
+                logger.info(f"RESTARTING TEST EXECUTION (Attempt {restart_attempt + 1}/{MAX_TEST_RESTARTS + 1})")
+            logger.info("=" * 100)
+            
+            if restart_attempt > 0:
+                print(f"\n{'='*100}")
+                print(f"🔄 RESTARTING ENTIRE TEST - Attempt {restart_attempt + 1}/{MAX_TEST_RESTARTS + 1}")
+                print(f"Previous attempt failed due to technical error")
+                print(f"Waiting {RESTART_DELAY} seconds before restart...")
+                print(f"{'='*100}\n")
+                time.sleep(RESTART_DELAY)
+            
+            # Run single attempt - if successful, return results
+            conversation_log, turns = run_bridge_single_attempt()
+            
+            # If we got here, test completed successfully!
+            logger.info("=" * 100)
+            logger.info("✅ TEST COMPLETED SUCCESSFULLY - NO ERRORS")
+            logger.info(f"  Turns completed: {turns}")
+            logger.info(f"  Restart attempts: {restart_attempt}")
+            logger.info("=" * 100)
+            
+            print(f"\n{'='*100}")
+            print(f"✅ TEST COMPLETED SUCCESSFULLY!")
+            print(f"  Turns: {turns}")
+            print(f"  Restart attempts: {restart_attempt}")
+            print(f"{'='*100}\n")
+            
+            return conversation_log, turns
+            
+        except RestartTestRequired as e:
+            restart_attempt += 1
+            logger.error("=" * 100)
+            logger.error(f"🚨 RESTART REQUIRED: {e.reason}")
+            logger.error(f"   Restart attempt: {restart_attempt}/{MAX_TEST_RESTARTS}")
+            logger.error("=" * 100)
+            
+            if restart_attempt > MAX_TEST_RESTARTS:
+                logger.error("❌ MAX RESTARTS EXCEEDED - TEST FAILED")
+                print(f"\n{'='*100}")
+                print(f"❌ MAX RESTARTS EXCEEDED ({MAX_TEST_RESTARTS})")
+                print(f"Test failed after {restart_attempt} attempts")
+                print(f"{'='*100}\n")
+                return [], 0
+            
+            # Continue to next iteration (restart)
+            continue
+            
+        except Exception as e:
+            # Other unexpected errors
+            log_exception(logger, e, "run_bridge_with_restart")
+            logger.error("=" * 100)
+            logger.error(f"❌ UNEXPECTED ERROR: {type(e).__name__}")
+            logger.error(f"   {e}")
+            logger.error("=" * 100)
+            print(f"\n❌ Unexpected error: {e}")
+            return [], 0
+    
+    # Should not reach here
+    return [], 0
+
+
 if __name__ == "__main__":
     logger.info("=" * 80)
     logger.info("SCRIPT STARTED FROM COMMAND LINE")
     logger.info("=" * 80)
     logger.info(f"Arguments: {sys.argv}")
+    logger.info(f"Restart strategy: ENABLED (max {MAX_TEST_RESTARTS} restarts)")
     
     try:
-        conversation_log, num_turns = run_bridge()
-        logger.info("=" * 80)
-        logger.info("✅ SCRIPT COMPLETED SUCCESSFULLY")
-        logger.info(f"  Conversation entries: {len(conversation_log)}")
-        logger.info(f"  Number of turns: {num_turns}")
-        logger.info("=" * 80)
-        print(f"\n📊 Summary:")
-        print(f"   Conversation entries: {len(conversation_log)}")
-        print(f"   Number of turns: {num_turns}")
+        conversation_log, num_turns = run_bridge_with_restart()
+        
+        if num_turns > 0:
+            logger.info("=" * 80)
+            logger.info("✅ SCRIPT COMPLETED SUCCESSFULLY")
+            logger.info(f"  Conversation entries: {len(conversation_log)}")
+            logger.info(f"  Number of turns: {num_turns}")
+            logger.info("=" * 80)
+            print(f"\n📊 Summary:")
+            print(f"   Conversation entries: {len(conversation_log)}")
+            print(f"   Number of turns: {num_turns}")
+        else:
+            logger.error("=" * 80)
+            logger.error("❌ SCRIPT FAILED")
+            logger.error("  Test did not complete successfully")
+            logger.error("=" * 80)
+            print(f"\n❌ Test failed to complete")
+            sys.exit(1)
+            
     except KeyboardInterrupt:
         logger.warning("=" * 80)
         logger.warning("⚠️ INTERRUPTED BY USER (Ctrl+C)")
         logger.warning("=" * 80)
         print("\n⚠️ Interrupted by user")
+        sys.exit(130)
     except Exception as e:
         log_exception(logger, e, "main script execution")
         logger.error("=" * 80)

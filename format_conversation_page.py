@@ -67,6 +67,7 @@ def parse_conversation_transcript(text: str) -> Dict[str, Any]:
         if turn_match:
             # Save previous message if exists
             if current_speaker and current_message_lines:
+                # Initialize turn if needed (for conversations without turn markers)
                 if current_turn is None:
                     current_turn = {'turn_number': 0, 'messages': []}
                 
@@ -115,6 +116,10 @@ def parse_conversation_transcript(text: str) -> Dict[str, Any]:
                     score = int(score_match.group(1))
                     message_text = re.sub(r'---\s*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$', '', message_text, flags=re.MULTILINE).strip()
                 
+                # Initialize turn if needed (for conversations without turn markers)
+                if current_turn is None:
+                    current_turn = {'turn_number': 0, 'messages': []}
+                
                 current_turn['messages'].append({
                     'speaker': current_speaker,
                     'text': message_text,
@@ -137,6 +142,10 @@ def parse_conversation_transcript(text: str) -> Dict[str, Any]:
                     score = int(score_match.group(1))
                     message_text = re.sub(r'---\s*[🟢🟡🟠🔴]\s*\*\*Completeness:\s*\d+/100\*\*.*$', '', message_text, flags=re.MULTILINE).strip()
                 
+                # Initialize turn if needed (for conversations without turn markers)
+                if current_turn is None:
+                    current_turn = {'turn_number': 0, 'messages': []}
+                
                 current_turn['messages'].append({
                     'speaker': current_speaker,
                     'text': message_text,
@@ -157,6 +166,7 @@ def parse_conversation_transcript(text: str) -> Dict[str, Any]:
     
     # Save final message and turn
     if current_speaker and current_message_lines:
+        # Initialize turn if needed (for conversations without turn markers)
         if current_turn is None:
             current_turn = {'turn_number': 0, 'messages': []}
         
@@ -252,6 +262,25 @@ def create_toggle_block(title: str, children: List[Dict[str, Any]]) -> Dict[str,
     }
 
 
+def create_toggle_blocks_with_limit(title: str, children: List[Dict[str, Any]], max_children: int = 100) -> List[Dict[str, Any]]:
+    """
+    Create one or more toggle blocks, splitting children if they exceed Notion's 100-child limit.
+    Returns a list of toggle blocks.
+    """
+    if len(children) <= max_children:
+        return [create_toggle_block(title, children)]
+    
+    toggle_blocks = []
+    total_parts = (len(children) + max_children - 1) // max_children
+    
+    for i in range(0, len(children), max_children):
+        chunk = children[i:i + max_children]
+        part_num = (i // max_children) + 1
+        chunk_title = f"{title} (Part {part_num}/{total_parts})" if total_parts > 1 else title
+        toggle_blocks.append(create_toggle_block(chunk_title, chunk))
+    
+    return toggle_blocks
+
 def split_text_for_notion(text: str, max_length: int = 2000) -> List[str]:
     """Split a long text into chunks for Notion (max chars per chunk)."""
     if not text:
@@ -288,17 +317,63 @@ def create_formatted_conversation_page(
     # Build blocks
     blocks: List[Dict[str, Any]] = []
     
-    # Add metadata section (collapsible)
+    # =====================================
+    # CLEAN METADATA SECTION - MODIFIED
+    # =====================================
     if parsed['metadata']:
         metadata_blocks = []
+        
+        # Define patterns to SKIP (technical noise)
+        skip_patterns = [
+            'DOM snapshot', 'Console Logs', 'Network Events',
+            'JavaScript Errors', 'UI State Snapshots', 'Message bubble',
+            'Error indicators', 'DIAGNOSTIC REPORT', '===',
+            'Session ID:', 'Generated:', 'Requests:', 'Responses:',
+            'Status Codes:', 'waiting for', 'Waiting for',
+            'Found menu', 'Found Clear', 'Clicked', 'clicking',
+            'filling', 'Filling', 'login', 'Login', 'cookie',
+            'Cookie', 'Saved', 'saved', 'diagnostics/',
+            'selector:', 'bubbles:', 'typing', 'complete_dom',
+            'sent_dom', 'health check', 'session:', 'API', 'api',
+            '.html', '.json', 'REPORT.txt', 'Opening', 'opening',
+            'Clearing', 'clearing', 'Creating', 'creating',
+            'Activated', 'activated', 'listeners', 'snapshot',
+            'Active sessions', 'OpenAI', 'model:', 'time:',
+            'Preview:', 'preview:', 'Length:', 'length:',
+            'attempt complete', 'send', 'Send', 'input',
+            'Input', 'bubble appeared', 'finished typing',
+            'new message', 'reply:', 'Tester API',
+            'Diagnostic', 'bytes', 'Bytes', 'Check #'
+        ]
+        
+        # Filter metadata to essential lines only
         for line in parsed['metadata'].split('\n'):
-            if line.strip():
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # Skip lines with technical patterns
+            if any(skip in line for skip in skip_patterns):
+                continue
+            
+            # Keep lines that look like important summary info
+            if any(keyword in line for keyword in [
+                'RESTART', 'TEST COMPLETED', 'Turns:', 'Restart attempts',
+                'Early exit', 'EARLY EXIT', 'score='
+            ]):
                 metadata_blocks.append(create_paragraph_block(line))
         
+        # Add filtered metadata if we have any essential info
         if metadata_blocks:
-            blocks.append(create_toggle_block("📋 Test Execution Metadata", metadata_blocks))
+            blocks.append(create_toggle_block("📋 Test Summary", metadata_blocks))
             blocks.append(create_divider_block())
-            logger.debug(f"Added metadata section with {len(metadata_blocks)} lines")
+            logger.debug(f"Added filtered metadata with {len(metadata_blocks)} essential lines")
+        else:
+            logger.debug("No essential metadata to display (all filtered out)")
+    
+    # =====================================
+    # END OF CLEAN METADATA SECTION
+    # =====================================
     
     # Add completeness score summary if scores are present
     scores = []
