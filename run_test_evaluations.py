@@ -218,71 +218,72 @@ def extract_page_id_from_url(url: str) -> Optional[str]:
 
 
 def load_text_from_page_blocks(page_id: str) -> str:
-    """Load text from a Notion page, handling the new formatted conversation structure."""
+    """Load text from a Notion page, handling nested blocks (toggles, etc.)."""
     page_uuid = format_notion_id(page_id)
     lines: List[str] = []
-    cursor = None
 
     def extract_rich_text(rich_text_list):
         return "".join(rt.get("plain_text", "") for rt in rich_text_list)
+
+    def fetch_children(block_id: str) -> list:
+        """Fetch all children of a block (paginated)."""
+        results = []
+        cursor = None
+        while True:
+            params: Dict[str, Any] = {}
+            if cursor:
+                params["start_cursor"] = cursor
+            resp = httpx.get(
+                f"{NOTION_API_BASE}/blocks/{block_id}/children",
+                headers=HEADERS,
+                params=params,
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+        return results
 
     def process_blocks(blocks):
         for block in blocks:
             btype = block.get("type")
             inner = block.get(btype, {})
-            
+
             if btype in ("paragraph", "heading_1", "heading_2", "heading_3"):
-                rich = inner.get("rich_text", [])
-                txt = extract_rich_text(rich)
+                txt = extract_rich_text(inner.get("rich_text", []))
                 if txt.strip():
                     lines.append(txt)
-            
+
             elif btype == "callout":
-                rich = inner.get("rich_text", [])
-                txt = extract_rich_text(rich)
+                txt = extract_rich_text(inner.get("rich_text", []))
                 if txt.strip():
                     lines.append(txt)
-            
+
             elif btype == "toggle":
-                rich = inner.get("rich_text", [])
-                txt = extract_rich_text(rich)
+                txt = extract_rich_text(inner.get("rich_text", []))
                 if txt.strip():
                     lines.append(txt)
-                
-                children = inner.get("children", [])
-                if children:
+                # Toggle children are NOT returned inline by the Notion API.
+                # Fetch them separately if the block has children.
+                if block.get("has_children"):
+                    children = fetch_children(block["id"])
                     process_blocks(children)
-            
+
             elif btype in ("bulleted_list_item", "numbered_list_item"):
-                rich = inner.get("rich_text", [])
-                txt = extract_rich_text(rich)
+                txt = extract_rich_text(inner.get("rich_text", []))
                 if txt.strip():
                     lines.append(txt)
 
-    while True:
-        params: Dict[str, Any] = {}
-        if cursor:
-            params["start_cursor"] = cursor
-
-        resp = httpx.get(
-            f"{NOTION_API_BASE}/blocks/{page_uuid}/children",
-            headers=HEADERS,
-            params=params,
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        process_blocks(data.get("results", []))
-
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
+    top_level = fetch_children(page_uuid)
+    process_blocks(top_level)
 
     full_text = "\n\n".join(lines).strip()
-    
+
     logger.debug(f"   📄 Extracted {len(full_text)} characters from conversation page")
-    
+
     return full_text
 
 
