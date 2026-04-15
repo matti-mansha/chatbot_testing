@@ -111,10 +111,19 @@ echo "   ./testbot tail execute         # tail a service log"
 echo "   ./testbot errors               # today's errors"
 if [ "$START_DASHBOARD" = "1" ] && [ -x "$STREAMLIT" ]; then
     echo ""
-    echo "🌐 Dashboard:  http://$DASHBOARD_HOST:$DASHBOARD_PORT/"
+    echo "🌐 Dashboard (direct):  http://$DASHBOARD_HOST:$DASHBOARD_PORT/"
     if [ "$DASHBOARD_HOST" = "127.0.0.1" ]; then
         echo "   SSH tunnel from your laptop:"
         echo "     ssh -i Matti-aupair.pem -L $DASHBOARD_PORT:localhost:$DASHBOARD_PORT ubuntu@<host>"
         echo "   Then open http://localhost:$DASHBOARD_PORT/"
+    fi
+
+    # If nginx reverse proxy is installed, show the public URL too
+    if [ -L /etc/nginx/sites-enabled/mila-dashboard ] && systemctl is-active --quiet nginx 2>/dev/null; then
+        PUBLIC_IP=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "<ec2-public-ip>")
+        echo ""
+        echo "🔒 Dashboard (public via nginx): ${PUBLIC_IP:+https://$PUBLIC_IP/}"
+        echo "   Credentials: /etc/nginx/htpasswd-mila"
+        echo "   Manage: ./testbot nginx-status | ./testbot nginx-install | ./testbot nginx-remove"
     fi
 fi

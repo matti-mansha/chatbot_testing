@@ -1,0 +1,103 @@
+# /etc/nginx/sites-available/mila-dashboard
+#
+# nginx reverse proxy for the MILA test-control dashboard.
+#
+# Fronts the Streamlit app (bound to 127.0.0.1:__UPSTREAM_PORT__) on :80
+# and :443, gated by HTTP Basic Auth (credentials in /etc/nginx/htpasswd-mila).
+#
+# This file is generated from nginx/mila-dashboard.conf.template by
+# nginx/install_nginx.sh. Placeholders starting with __ are replaced there.
+#
+# Security notes:
+#   * The dashboard itself stays bound to localhost; nginx is the only
+#     public-facing listener. Killing nginx instantly cuts external access.
+#   * Basic Auth over plain :80 sends credentials base64-encoded, which is
+#     readable on the wire. That's why we ALSO set up :443 with a
+#     self-signed cert and 301-redirect :80 → :443. Browsers will show a
+#     one-time cert warning.
+#   * limit_req throttles to 30 r/s per IP with a burst of 60 — enough for
+#     normal Streamlit use (the app polls WebSockets every second or two),
+#     rate-limits bots.
+#   * /health is exempt from auth + rate limiting so external monitors can
+#     check liveness.
+
+# --- Rate limit zone (must be in http{} block) --------------------------------
+# Defined in /etc/nginx/conf.d/mila-ratelimit.conf to avoid colliding with
+# other sites on this host. The installer writes that file too.
+
+# --- HTTP :80 → redirect to HTTPS :443 ----------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    # Expose /health over plain HTTP for monitoring
+    location = /health {
+        access_log off;
+        auth_basic off;
+        add_header Content-Type "text/plain";
+        return 200 "ok\n";
+    }
+
+    # Redirect everything else to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --- HTTPS :443 — the real dashboard listener ---------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     __SSL_CERT_PATH__;
+    ssl_certificate_key __SSL_KEY_PATH__;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Hide nginx version in error pages / Server header
+    server_tokens off;
+
+    # Generous timeout for Streamlit's long-lived WebSocket connections
+    proxy_read_timeout  300s;
+    proxy_send_timeout  300s;
+    client_max_body_size 16m;
+
+    # Rate limit: 30 r/s per IP, burst 60 (see conf.d/mila-ratelimit.conf)
+    limit_req zone=mila_dashboard burst=60 nodelay;
+
+    # No-auth health check (for external monitors / ALBs)
+    location = /health {
+        access_log off;
+        auth_basic off;
+        add_header Content-Type "text/plain";
+        return 200 "ok\n";
+    }
+
+    # Main dashboard — auth-gated
+    location / {
+        auth_basic           "MILA Test Control";
+        auth_basic_user_file /etc/nginx/htpasswd-mila;
+
+        proxy_pass http://127.0.0.1:__UPSTREAM_PORT__;
+        proxy_http_version 1.1;
+
+        # Required for Streamlit's WebSocket transport
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Standard forwarding headers
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Buffering off helps with streamlit's server-push behavior
+        proxy_buffering off;
+    }
+}

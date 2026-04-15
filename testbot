@@ -13,6 +13,9 @@
 #     ./testbot dashboard           # launch the Streamlit dashboard on :8502
 #     ./testbot retention [--dry]   # run the log retention sweep
 #     ./testbot disk                # show disk usage for logs/ and diagnostics/
+#     ./testbot nginx-install [opts]   # install nginx reverse proxy on :443 (sudo)
+#     ./testbot nginx-status           # show nginx + dashboard reverse proxy state
+#     ./testbot nginx-remove           # uninstall nginx reverse proxy (sudo)
 #     ./testbot help                # print this help
 #
 # Service names for tail / errors: tester_bot, prepare, execute, evaluate, bridge, format
@@ -238,6 +241,89 @@ cmd_retention() {
     "$VENV_PY" log_retention.py "$@"
 }
 
+cmd_nginx_install() {
+    if [[ ! -x "$BASE_DIR/nginx/install_nginx.sh" ]]; then
+        echo "error: $BASE_DIR/nginx/install_nginx.sh not found or not executable" >&2
+        return 1
+    fi
+    if [[ "$(id -u)" != "0" ]]; then
+        echo "This needs sudo. Re-running as: sudo $BASE_DIR/nginx/install_nginx.sh $*" >&2
+        exec sudo "$BASE_DIR/nginx/install_nginx.sh" "$@"
+    fi
+    exec "$BASE_DIR/nginx/install_nginx.sh" "$@"
+}
+
+cmd_nginx_status() {
+    echo "${C_BOLD}${C_CYAN}━━━ nginx reverse proxy status ━━━${C_RESET}"
+    if ! command -v nginx >/dev/null 2>&1; then
+        echo "${C_DIM}nginx is not installed${C_RESET}"
+        return 0
+    fi
+
+    # Is nginx running?
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        echo "${C_GREEN}●${C_RESET} nginx service: ${C_GREEN}active${C_RESET}"
+    else
+        echo "${C_RED}●${C_RESET} nginx service: ${C_RED}inactive${C_RESET}"
+    fi
+
+    # Is the mila-dashboard site enabled?
+    if [[ -L /etc/nginx/sites-enabled/mila-dashboard ]]; then
+        echo "${C_GREEN}●${C_RESET} mila-dashboard site: ${C_GREEN}enabled${C_RESET}"
+    else
+        echo "${C_DIM}●${C_RESET} mila-dashboard site: ${C_DIM}not enabled${C_RESET}"
+    fi
+
+    # htpasswd present?
+    if [[ -f /etc/nginx/htpasswd-mila ]]; then
+        local user
+        user=$(cut -d: -f1 /etc/nginx/htpasswd-mila 2>/dev/null | head -1)
+        echo "${C_GREEN}●${C_RESET} htpasswd: ${C_GREEN}present${C_RESET} (user: ${user:-unknown})"
+    else
+        echo "${C_DIM}●${C_RESET} htpasswd: ${C_DIM}missing${C_RESET}"
+    fi
+
+    # SSL cert info
+    if [[ -f /etc/ssl/mila-dashboard/fullchain.pem ]]; then
+        local expiry
+        expiry=$(openssl x509 -in /etc/ssl/mila-dashboard/fullchain.pem -noout -enddate 2>/dev/null | cut -d= -f2)
+        echo "${C_GREEN}●${C_RESET} SSL cert: ${C_GREEN}present${C_RESET} (expires: ${expiry:-unknown})"
+    else
+        echo "${C_DIM}●${C_RESET} SSL cert: ${C_DIM}missing${C_RESET}"
+    fi
+
+    echo
+    echo "${C_BOLD}listening ports:${C_RESET}"
+    ss -tlnp 2>/dev/null | awk 'NR==1 || /:(80|443|8502) / {print}' || netstat -tlnp 2>/dev/null | grep -E ':(80|443|8502) '
+
+    # Public IP hint
+    local pub
+    pub=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
+    if [[ -n "$pub" ]]; then
+        echo
+        echo "${C_BOLD}public URL:${C_RESET} https://$pub/"
+    fi
+
+    # Last 5 access log lines if readable
+    if [[ -r /var/log/nginx/access.log ]]; then
+        echo
+        echo "${C_DIM}recent access log (last 5):${C_RESET}"
+        tail -5 /var/log/nginx/access.log 2>/dev/null
+    fi
+}
+
+cmd_nginx_remove() {
+    if [[ ! -x "$BASE_DIR/nginx/uninstall_nginx.sh" ]]; then
+        echo "error: $BASE_DIR/nginx/uninstall_nginx.sh not found" >&2
+        return 1
+    fi
+    if [[ "$(id -u)" != "0" ]]; then
+        echo "This needs sudo. Re-running..." >&2
+        exec sudo "$BASE_DIR/nginx/uninstall_nginx.sh"
+    fi
+    exec "$BASE_DIR/nginx/uninstall_nginx.sh"
+}
+
 cmd_disk() {
     echo "${C_BOLD}disk usage (tracked directories):${C_RESET}"
     for d in "$LOG_DIR" "$DIAG_DIR" "$BASE_DIR/screenshots"; do
@@ -273,6 +359,9 @@ main() {
         dashboard|dash)    cmd_dashboard ;;
         retention)     cmd_retention "$@" ;;
         disk)          cmd_disk ;;
+        nginx-install|nginx_install)  cmd_nginx_install "$@" ;;
+        nginx-status|nginx_status)    cmd_nginx_status ;;
+        nginx-remove|nginx_remove|nginx-uninstall)  cmd_nginx_remove ;;
         help|-h|--help)    cmd_help ;;
         *)
             echo "unknown command: $cmd" >&2
