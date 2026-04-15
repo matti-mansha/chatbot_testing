@@ -47,9 +47,13 @@ server {
 
 # --- HTTPS :443 — the real dashboard listener ---------------------------------
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    # `http2` as a parameter to `listen` is the nginx 1.24-and-older syntax
+    # for enabling HTTP/2. Newer nginx (1.25+) prefers `http2 on;` in the
+    # server block and prints a deprecation warning for this form, but the
+    # old form still works on both, so we use it for portability across
+    # distro nginx versions (Ubuntu Noble ships 1.24).
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name _;
 
     ssl_certificate     __SSL_CERT_PATH__;
