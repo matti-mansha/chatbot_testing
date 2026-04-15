@@ -1804,6 +1804,18 @@ def run_bridge_with_restart() -> Tuple[List[Dict[str, str]], int]:
                 print(f"{'='*100}\n")
                 time.sleep(RESTART_DELAY)
 
+            # Emit a boundary marker that format_conversation_page.py uses to
+            # scope the conversation-page parser to only the FINAL attempt's
+            # output. Without this, stdout captured by run_test_executions.py's
+            # subprocess.run(capture_output=True) contains concatenated output
+            # from all restart attempts, and the Notion conversation page ends
+            # up showing, e.g., "Turn 1, Turn 2, Turn 3, Turn 4, Turn 5, Turn 1"
+            # (turns from a failed attempt 1 followed by turn 1 of attempt 2).
+            # The parser does `text.rfind(boundary)` and keeps only the tail,
+            # so each attempt overwrites the previous one in rendering terms
+            # while the raw bridge log still has every attempt for forensics.
+            print("\n===BRIDGE_ATTEMPT_BOUNDARY===\n")
+
             # Run single attempt - if successful, return results
             conversation_log, turns = run_bridge_single_attempt()
 

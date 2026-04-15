@@ -130,12 +130,57 @@ def _is_turn_marker(line: str):
     return None
 
 
+BRIDGE_ATTEMPT_BOUNDARY = "===BRIDGE_ATTEMPT_BOUNDARY==="
+
+
+def _trim_to_last_attempt(text: str) -> str:
+    """
+    When the bridge bot restarts mid-run (e.g. MilaBackendRejection), its
+    subprocess stdout accumulates output from ALL attempts — the final
+    conversation page would otherwise show duplicate/out-of-order turns like
+    "1, 2, 3, 4, 5, 1".
+
+    The bridge prints `===BRIDGE_ATTEMPT_BOUNDARY===` at the start of each
+    attempt. We keep only the content after the LAST boundary (= the final
+    attempt). Any bridge-failure banner prepended by run_test_executions.py
+    appears BEFORE the first boundary and is preserved by carrying it across
+    the trim. If no boundary exists (older bridge versions, or success-only
+    successful runs before the boundary feature), we return the text
+    unchanged.
+    """
+    last = text.rfind(BRIDGE_ATTEMPT_BOUNDARY)
+    if last == -1:
+        return text
+
+    pre = text[:last]
+    post = text[last + len(BRIDGE_ATTEMPT_BOUNDARY):]
+
+    # Preserve the "⚠️ BRIDGE FAILURE / ... / --- Partial transcript below ---"
+    # banner if run_test_executions.py prepended one. It's diagnostic content
+    # that the user wants to see on failed pages.
+    import re as _re
+    banner_match = _re.search(
+        r'(⚠️ BRIDGE FAILURE.*?--- Partial transcript below[^\n]*---\n\n)',
+        pre,
+        _re.DOTALL,
+    )
+    banner = banner_match.group(1) if banner_match else ''
+
+    trimmed = banner + post
+    logger.debug(
+        f"Trimmed stdout to final attempt: {len(text)} → {len(trimmed)} chars "
+        f"(banner preserved: {bool(banner)})"
+    )
+    return trimmed
+
+
 def parse_conversation_transcript(text: str) -> Dict[str, Any]:
     """
     Parse the conversation transcript into structured sections.
     Returns a dict with metadata and turns.
     """
     logger.debug(f"Parsing conversation transcript ({len(text)} chars)")
+    text = _trim_to_last_attempt(text)
     lines = text.split('\n')
 
     # ---- find conversation boundaries ----
