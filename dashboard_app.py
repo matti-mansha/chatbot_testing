@@ -44,6 +44,16 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+
+# streamlit-autorefresh is the clean way to do partial-rerun-based auto-refresh
+# (no page reload, no flicker, preserves scroll). Fall back to a full page
+# reload via a components.v1.html iframe if the package isn't installed.
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except Exception:
+    HAS_AUTOREFRESH = False
 
 # =============================================================================
 # CONFIG
@@ -687,11 +697,15 @@ def render_hero(svc_state: Dict[str, Dict[str, Any]]) -> None:
             f'bridge PID {bridge["pid"]}<span class="muted">· {bridge["etime"]}</span></div>'
         )
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_local = datetime.now().strftime("%H:%M:%S")
+    refresh_label = (
+        f"Auto-refresh · tick {now_local}" if HAS_AUTOREFRESH else f"Full reload · tick {now_local}"
+    )
     st.markdown(
         f"""
 <div class="hero">
     <div class="hero-title">🧪 MILA TEST CONTROL</div>
-    <div class="hero-sub">Auto-refresh every {AUTO_REFRESH_MS//1000}s · {now_utc}</div>
+    <div class="hero-sub">{refresh_label} · {now_utc}</div>
     <div class="status-row">
         {''.join(pills_html)}
         {bridge_pill}
@@ -1024,16 +1038,52 @@ def render_services_tab(svc_state: Dict[str, Dict[str, Any]]) -> None:
 # =============================================================================
 
 def main() -> None:
-    # Auto-refresh via injected JS. Streamlit's native rerun on button click
-    # still works; this just triggers a page reload every AUTO_REFRESH_MS.
-    st.markdown(
-        f"""
+    # ---- Auto-refresh control (sidebar) -------------------------------------
+    with st.sidebar:
+        st.markdown("### ⚙️ Refresh")
+        auto_on = st.toggle("Auto-refresh", value=True, key="auto_on")
+        interval_sec = st.slider(
+            "Every N seconds",
+            min_value=2,
+            max_value=30,
+            value=int(AUTO_REFRESH_MS / 1000),
+            step=1,
+            key="refresh_interval",
+        )
+        if st.button("🔄 Refresh now", use_container_width=True, key="refresh_sidebar"):
+            st.rerun()
+        if not HAS_AUTOREFRESH:
+            st.caption(
+                "ℹ️ `streamlit-autorefresh` not installed. Using full-page "
+                "reload fallback — install it for smoother updates: "
+                "`pip install streamlit-autorefresh`"
+            )
+        st.caption(f"Last tick: {datetime.now().strftime('%H:%M:%S')}")
+
+    # ---- Trigger the auto-refresh -------------------------------------------
+    if auto_on:
+        if HAS_AUTOREFRESH:
+            # Clean server-side rerun every N seconds. Streamlit re-executes
+            # the script from the top, so all data_layer functions re-query
+            # the logs/filesystem and re-render. No flicker, no scroll reset.
+            st_autorefresh(interval=interval_sec * 1000, key="dashboard_tick")
+        else:
+            # Fallback: full page reload via an iframe component. Components
+            # ARE allowed to execute JS (unlike st.markdown). `window.parent`
+            # targets the outer Streamlit frame, not the component iframe.
+            components.html(
+                f"""
 <script>
-    setTimeout(function(){{ window.location.reload(); }}, {AUTO_REFRESH_MS});
+  (function() {{
+    setTimeout(function() {{
+      try {{ window.parent.location.reload(); }}
+      catch (e) {{ window.location.reload(); }}
+    }}, {interval_sec * 1000});
+  }})();
 </script>
 """,
-        unsafe_allow_html=True,
-    )
+                height=0,
+            )
 
     svc = service_state()
     render_hero(svc)
