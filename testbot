@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# testbot — a small CLI wrapper around the chatbot-testing pipeline
+#
+# Usage:
+#     ./testbot status              # show service + bridge + queue state
+#     ./testbot ps                  # list all bot processes with PIDs + uptime
+#     ./testbot tail <svc> [n]      # tail a service log (default 60 lines)
+#     ./testbot errors              # show today's errors across all services
+#     ./testbot kill-bridge         # kill the currently-running bridge subprocess
+#     ./testbot stop                # stop all services (wraps stop_services.sh)
+#     ./testbot start               # start all services (wraps start_services.sh)
+#     ./testbot restart             # stop + start
+#     ./testbot dashboard           # launch the Streamlit dashboard on :8502
+#     ./testbot retention [--dry]   # run the log retention sweep
+#     ./testbot disk                # show disk usage for logs/ and diagnostics/
+#     ./testbot help                # print this help
+#
+# Service names for tail / errors: tester_bot, prepare, execute, evaluate, bridge, format
+#
+# Exit codes: 0 on success, non-zero on any invoked tool's failure.
+
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BASE_DIR"
+
+DATE="$(date +%Y%m%d)"
+LOG_DIR="$BASE_DIR/logs"
+DIAG_DIR="$BASE_DIR/diagnostics"
+VENV_PY="$BASE_DIR/env/bin/python"
+VENV_STREAMLIT="$BASE_DIR/env/bin/streamlit"
+
+# ---- colors (respect NO_COLOR) ----
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
+    C_CYAN=$'\033[36m'
+else
+    C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_MAGENTA="" C_CYAN=""
+fi
+
+# Map friendly service name → log basename
+log_basename() {
+    case "$1" in
+        tester_bot|testbot)  echo "test_bot_headless" ;;
+        prepare)             echo "prepare_test_runs" ;;
+        execute|exec)        echo "test_execution" ;;
+        evaluate|eval)       echo "test_evaluation" ;;
+        bridge)              echo "playwright_bridge" ;;
+        format)              echo "format_conversation_page" ;;
+        *)                   echo "" ;;
+    esac
+}
+
+# Map friendly service name → process grep pattern
+ps_pattern() {
+    case "$1" in
+        tester_bot|testbot)  echo "test_bot_headless.py" ;;
+        prepare)             echo "prepare_test_runs.py" ;;
+        execute|exec)        echo "run_test_executions.py" ;;
+        evaluate|eval)       echo "run_test_evaluations.py" ;;
+        bridge)              echo "playwright_bridge_bot_headless.py" ;;
+        *)                   echo "" ;;
+    esac
+}
+
+# Return PID of the matching process, or empty
+find_pid() {
+    local pattern="$1"
+    ps -ef | awk -v pat="$pattern" '$0 ~ pat && !/grep/ && !/awk/ {print $2; exit}'
+}
+
+cmd_status() {
+    echo "${C_BOLD}${C_CYAN}━━━ MILA test pipeline status ━━━${C_RESET}"
+    echo
+
+    local services=(tester_bot prepare execute evaluate)
+    printf "${C_BOLD}%-12s %-8s %-10s %s${C_RESET}\n" "SERVICE" "PID" "UPTIME" "STATE"
+    for svc in "${services[@]}"; do
+        local pat
+        pat=$(ps_pattern "$svc")
+        local info
+        info=$(ps -eo pid,etime,cmd --no-headers 2>/dev/null | awk -v pat="$pat" '$0 ~ pat && !/grep/ && !/awk/ {print $1, $2; exit}')
+        if [[ -n "$info" ]]; then
+            local pid etime
+            pid=$(awk '{print $1}' <<< "$info")
+            etime=$(awk '{print $2}' <<< "$info")
+            printf "${C_GREEN}●${C_RESET} %-10s %-8s %-10s ${C_GREEN}alive${C_RESET}\n" "$svc" "$pid" "$etime"
+        else
+            printf "${C_RED}●${C_RESET} %-10s %-8s %-10s ${C_RED}DOWN${C_RESET}\n" "$svc" "-" "-"
+        fi
+    done
+
+    echo
+    echo "${C_BOLD}${C_CYAN}━━━ Currently running bridge ━━━${C_RESET}"
+    local bridge_info
+    bridge_info=$(ps -eo pid,etime,cmd --no-headers 2>/dev/null | awk '/playwright_bridge_bot_headless\.py/ && !/grep/ && !/awk/ {print; exit}')
+    if [[ -n "$bridge_info" ]]; then
+        local bpid betime
+        bpid=$(awk '{print $1}' <<< "$bridge_info")
+        betime=$(awk '{print $2}' <<< "$bridge_info")
+        echo "${C_BLUE}●${C_RESET} bridge  PID $bpid  uptime $betime"
+
+        # Try to extract the test case from the cmdline (first arg)
+        local tc
+        tc=$(echo "$bridge_info" | sed -E 's/.*playwright_bridge_bot_headless\.py[[:space:]]+//' | cut -c1-70)
+        echo "  ${C_DIM}test:${C_RESET} $tc..."
+
+        # Latest TURN from the bridge log
+        local bridge_log="$LOG_DIR/playwright_bridge_${DATE}.log"
+        if [[ -f "$bridge_log" ]]; then
+            local last_turn
+            last_turn=$(grep -E "TURN [0-9]+/[0-9]+" "$bridge_log" | tail -1 | sed -E 's/.*\| *//')
+            echo "  ${C_DIM}latest:${C_RESET} $last_turn"
+        fi
+    else
+        echo "${C_DIM}(no bridge running)${C_RESET}"
+    fi
+
+    echo
+    echo "${C_BOLD}${C_CYAN}━━━ Queue state (latest poll) ━━━${C_RESET}"
+    local exec_log="$LOG_DIR/test_execution_${DATE}.log"
+    if [[ -f "$exec_log" ]]; then
+        local pending
+        pending=$(grep -E "Found [0-9]+ pending" "$exec_log" | tail -1 | grep -oE 'Found [0-9]+' || echo "")
+        echo "  ${pending:-(unknown)}"
+        local today_passed today_failed
+        today_passed=$(grep -cE "✓ Execution .* completed successfully" "$exec_log" 2>/dev/null || echo 0)
+        today_failed=$(grep -cE "✗ Execution .* failed" "$exec_log" 2>/dev/null || echo 0)
+        echo "  today: ${C_GREEN}${today_passed} passed${C_RESET}, ${C_RED}${today_failed} failed${C_RESET}"
+    else
+        echo "${C_DIM}(no execute log for today yet)${C_RESET}"
+    fi
+}
+
+cmd_ps() {
+    ps -eo pid,ppid,etime,stat,cmd --no-headers | awk '/(test_bot_headless|prepare_test_runs|run_test_executions|run_test_evaluations|playwright_bridge|chrome-headless)/ && !/grep/ && !/awk/'
+}
+
+cmd_tail() {
+    local svc="${1:-}"
+    local n="${2:-60}"
+    if [[ -z "$svc" ]]; then
+        echo "usage: $0 tail <svc> [n]" >&2
+        echo "  services: tester_bot, prepare, execute, evaluate, bridge, format" >&2
+        return 2
+    fi
+    local base
+    base=$(log_basename "$svc")
+    if [[ -z "$base" ]]; then
+        echo "unknown service: $svc" >&2
+        return 2
+    fi
+    local f="$LOG_DIR/${base}_${DATE}.log"
+    if [[ ! -f "$f" ]]; then
+        echo "no log file for today: $f" >&2
+        return 1
+    fi
+    echo "${C_DIM}--- tail -n $n $f ---${C_RESET}" >&2
+    tail -n "$n" "$f"
+}
+
+cmd_errors() {
+    echo "${C_BOLD}${C_CYAN}━━━ Today's ERRORs / Tracebacks / 🚨 ━━━${C_RESET}"
+    local files=()
+    for svc in tester_bot prepare execute evaluate bridge format; do
+        local base
+        base=$(log_basename "$svc")
+        [[ -z "$base" ]] && continue
+        local f="$LOG_DIR/${base}_${DATE}.log"
+        [[ -f "$f" ]] && files+=("$f")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "${C_DIM}(no log files for today)${C_RESET}"
+        return 0
+    fi
+    grep -E "ERROR|Traceback|🚨|CRITICAL|FATAL" "${files[@]}" 2>/dev/null | tail -30 || echo "${C_GREEN}(none found)${C_RESET}"
+}
+
+cmd_kill_bridge() {
+    local pid
+    pid=$(find_pid "playwright_bridge_bot_headless.py")
+    if [[ -z "$pid" ]]; then
+        echo "no bridge running" >&2
+        return 1
+    fi
+    echo "killing bridge PID $pid..."
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f chrome-headless-shell 2>/dev/null || true
+    echo "done"
+}
+
+cmd_stop() {
+    ./stop_services.sh
+    sleep 1
+    pkill -9 -f playwright_bridge_bot_headless 2>/dev/null || true
+    pkill -9 -f chrome-headless-shell 2>/dev/null || true
+    echo "all stopped"
+}
+
+cmd_start() {
+    ./start_services.sh
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_dashboard() {
+    if [[ ! -x "$VENV_STREAMLIT" ]]; then
+        echo "error: $VENV_STREAMLIT not found (venv missing?)" >&2
+        return 1
+    fi
+    echo "${C_BOLD}${C_CYAN}Launching dashboard on http://127.0.0.1:8502 ...${C_RESET}"
+    echo "${C_DIM}(SSH tunnel: ssh -L 8502:localhost:8502 ubuntu@<host>)${C_RESET}"
+    "$VENV_STREAMLIT" run dashboard_app.py \
+        --server.address=127.0.0.1 \
+        --server.port=8502 \
+        --server.headless=true \
+        --browser.gatherUsageStats=false \
+        --theme.base=dark
+}
+
+cmd_retention() {
+    if [[ ! -x "$VENV_PY" ]]; then
+        echo "error: $VENV_PY not found (venv missing?)" >&2
+        return 1
+    fi
+    "$VENV_PY" log_retention.py "$@"
+}
+
+cmd_disk() {
+    echo "${C_BOLD}disk usage (tracked directories):${C_RESET}"
+    for d in "$LOG_DIR" "$DIAG_DIR" "$BASE_DIR/screenshots"; do
+        if [[ -d "$d" ]]; then
+            du -sh "$d" 2>/dev/null
+        fi
+    done
+    echo
+    echo "${C_BOLD}largest 10 files:${C_RESET}"
+    find "$LOG_DIR" "$DIAG_DIR" "$BASE_DIR/screenshots" -type f 2>/dev/null \
+        | xargs -I{} du -k "{}" 2>/dev/null \
+        | sort -nr \
+        | head -10 \
+        | awk '{sz=$1; $1=""; printf "  %7.1f MB  %s\n", sz/1024, substr($0,2)}'
+}
+
+cmd_help() {
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        status)        cmd_status ;;
+        ps)            cmd_ps ;;
+        tail)          cmd_tail "$@" ;;
+        errors|err)    cmd_errors ;;
+        kill-bridge|kill)  cmd_kill_bridge ;;
+        stop)          cmd_stop ;;
+        start)         cmd_start ;;
+        restart)       cmd_restart ;;
+        dashboard|dash)    cmd_dashboard ;;
+        retention)     cmd_retention "$@" ;;
+        disk)          cmd_disk ;;
+        help|-h|--help)    cmd_help ;;
+        *)
+            echo "unknown command: $cmd" >&2
+            cmd_help
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
