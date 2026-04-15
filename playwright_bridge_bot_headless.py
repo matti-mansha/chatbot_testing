@@ -44,6 +44,23 @@ class RestartTestRequired(Exception):
         super().__init__(reason)
 
 
+class MilaBackendRejection(RestartTestRequired):
+    """
+    Raised when Mila's backend itself crashes ("something went terribly
+    wrong", "Please try to ask me again") in response to the user message.
+
+    Subclasses RestartTestRequired so all existing catch sites still work,
+    but the outer restart loop recognizes this as a CONTENT-INDUCED crash
+    rather than a transient environment issue, and caps retries at
+    MAX_MILA_REJECTION_RETRIES (default 1) because the same deterministic
+    test-case content will simply crash Mila's backend again on the next
+    attempt. Burning 5 retries × 2 min each on content the backend can't
+    handle wastes time and credits. Observed for safety-adjacent test cases
+    where Mila's xi-deepchat API returns HTTP 500 on turn 1.
+    """
+    pass
+
+
 # =====================================
 # LOAD .env
 # =====================================
@@ -71,6 +88,13 @@ TESTER_API_TIMEOUT = float(os.getenv("TESTER_API_TIMEOUT", "120"))
 # ✅ NEW: Complete restart configuration
 MAX_TEST_RESTARTS = int(os.getenv("MAX_TEST_RESTARTS", "5"))  # Max times to restart entire test
 RESTART_DELAY = int(os.getenv("RESTART_DELAY", "10"))  # Seconds to wait before restarting
+
+# Separate, tighter retry budget for content-induced Mila backend crashes
+# (see MilaBackendRejection). Default 1 means: do ONE retry to rule out a
+# transient blip, then bail out immediately. Adversarial test cases that
+# deterministically crash Mila's backend should not burn the full 5-retry
+# budget — that's ~10 minutes per test case thrown away for no useful signal.
+MAX_MILA_REJECTION_RETRIES = int(os.getenv("MAX_MILA_REJECTION_RETRIES", "1"))
 
 # Mila web login credentials
 MILA_LOGIN_USER = os.getenv("MILA_LOGIN_USER", "").strip()
@@ -684,33 +708,44 @@ def wait_for_new_message(page: Page, selector: str, previous_count: int, timeout
         if check_count % 3 == 0:  # Check every 3rd iteration
             try:
                 # Quick check for error message (no long timeout)
-                # Use partial text matching with :has-text() for robustness
+                # Use partial text matching with :has-text() for robustness.
+                # These patterns specifically indicate Mila's xi-deepchat API
+                # returned HTTP 500 (content-induced backend crash). They are
+                # raised as MilaBackendRejection so the outer restart loop
+                # can cap retries tightly instead of burning the full budget
+                # on content that will deterministically crash again.
                 error_text_patterns = [
                     "something went terribly wrong",
                     "Please try to ask me again",
                 ]
-                
+
                 for pattern in error_text_patterns:
                     try:
                         # Use :has-text() for partial matching (more robust than exact text match)
                         error_elem = page.locator(f":has-text('{pattern}')").first
                         if error_elem.is_visible(timeout=100):
-                            logger.error(f"🚨 TECHNICAL ERROR DETECTED during wait (after {elapsed:.1f}s)")
+                            logger.error(f"🚨 MILA BACKEND REJECTION during wait (after {elapsed:.1f}s)")
                             logger.error(f"   Pattern matched: '{pattern}'")
-                            logger.error(f"   ⚠️ INITIATING COMPLETE TEST RESTART")
-                            print(f"🚨 Technical error detected - RESTARTING ENTIRE TEST!")
-                            
+                            logger.error(f"   ⚠️ Content likely triggers xi-deepchat 500 — will retry at most {MAX_MILA_REJECTION_RETRIES} time(s)")
+                            print(f"🚨 Mila backend rejected this content — fast-fail path")
+
                             # Take screenshot of error
                             take_screenshot(page, f"error_detected_restart_needed")
-                            
-                            # Raise exception to trigger complete restart
-                            raise RestartTestRequired(f"Technical error detected: '{pattern}' at {elapsed:.1f}s into wait")
-                            
+
+                            # Raise the specific subclass so run_bridge_with_restart
+                            # knows to use the tighter MAX_MILA_REJECTION_RETRIES
+                            # budget instead of MAX_TEST_RESTARTS.
+                            raise MilaBackendRejection(
+                                f"Mila backend rejection pattern '{pattern}' "
+                                f"detected at {elapsed:.1f}s into wait"
+                            )
+
                     except PlaywrightTimeoutError:
                         # Error selector not found, continue
                         continue
                     except RestartTestRequired:
-                        # Re-raise to propagate up
+                        # Re-raise to propagate up (covers both RestartTestRequired
+                        # and its MilaBackendRejection subclass)
                         raise
                     except Exception as e:
                         # Other errors, ignore and continue
@@ -1719,65 +1754,130 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
 
 def run_bridge_with_restart() -> Tuple[List[Dict[str, str]], int]:
     """
-    Run the bridge with complete restart strategy.
-    If RestartTestRequired is raised, restart entire test from scratch.
-    Keep trying until success or max restarts reached.
+    Run the bridge with a complete restart strategy.
+
+    Two separate retry budgets are tracked:
+
+      * restart_attempt     — for general RestartTestRequired errors
+                              (transient Playwright / environment issues).
+                              Capped at MAX_TEST_RESTARTS (default 5).
+
+      * mila_reject_attempt — for MilaBackendRejection specifically, i.e.
+                              Mila's xi-deepchat API returning the
+                              "something went terribly wrong" error bubble
+                              (HTTP 500 induced by the test-case content).
+                              Capped at MAX_MILA_REJECTION_RETRIES
+                              (default 1 — one retry to rule out transience,
+                              then fail fast). Burning the full 5-retry
+                              budget on content the backend deterministically
+                              can't handle wastes ~10 minutes per test case.
+
+    Both counters can independently reach their cap. Either one triggering
+    the cap terminates the test with ([], 0), which propagates to exit 1.
     """
     restart_attempt = 0
-    
-    while restart_attempt <= MAX_TEST_RESTARTS:
+    mila_reject_attempt = 0
+
+    while True:
+        attempt_number = restart_attempt + mila_reject_attempt + 1
+        total_budget = MAX_TEST_RESTARTS + MAX_MILA_REJECTION_RETRIES + 1
         try:
             logger.info("=" * 100)
-            if restart_attempt == 0:
-                logger.info(f"STARTING TEST EXECUTION (Attempt 1/{MAX_TEST_RESTARTS + 1})")
+            if restart_attempt + mila_reject_attempt == 0:
+                logger.info(
+                    f"STARTING TEST EXECUTION (Attempt 1/{total_budget})"
+                )
             else:
-                logger.info(f"RESTARTING TEST EXECUTION (Attempt {restart_attempt + 1}/{MAX_TEST_RESTARTS + 1})")
+                logger.info(
+                    f"RESTARTING TEST EXECUTION "
+                    f"(Attempt {attempt_number}/{total_budget}, "
+                    f"general={restart_attempt}/{MAX_TEST_RESTARTS}, "
+                    f"mila-reject={mila_reject_attempt}/{MAX_MILA_REJECTION_RETRIES})"
+                )
             logger.info("=" * 100)
-            
-            if restart_attempt > 0:
+
+            if restart_attempt + mila_reject_attempt > 0:
                 print(f"\n{'='*100}")
-                print(f"🔄 RESTARTING ENTIRE TEST - Attempt {restart_attempt + 1}/{MAX_TEST_RESTARTS + 1}")
+                print(f"🔄 RESTARTING ENTIRE TEST - Attempt {attempt_number}/{total_budget}")
                 print(f"Previous attempt failed due to technical error")
                 print(f"Waiting {RESTART_DELAY} seconds before restart...")
                 print(f"{'='*100}\n")
                 time.sleep(RESTART_DELAY)
-            
+
             # Run single attempt - if successful, return results
             conversation_log, turns = run_bridge_single_attempt()
-            
+
             # If we got here, test completed successfully!
             logger.info("=" * 100)
             logger.info("✅ TEST COMPLETED SUCCESSFULLY - NO ERRORS")
             logger.info(f"  Turns completed: {turns}")
-            logger.info(f"  Restart attempts: {restart_attempt}")
+            logger.info(f"  General restarts: {restart_attempt}")
+            logger.info(f"  Mila-reject restarts: {mila_reject_attempt}")
             logger.info("=" * 100)
-            
+
             print(f"\n{'='*100}")
             print(f"✅ TEST COMPLETED SUCCESSFULLY!")
             print(f"  Turns: {turns}")
-            print(f"  Restart attempts: {restart_attempt}")
+            print(f"  Total restart attempts: {restart_attempt + mila_reject_attempt}")
             print(f"{'='*100}\n")
-            
+
             return conversation_log, turns
-            
+
+        except MilaBackendRejection as e:
+            # Content-induced backend crash. Use the tight retry budget —
+            # retrying does not help when the same deterministic input will
+            # crash Mila's backend the same way next time.
+            mila_reject_attempt += 1
+            logger.error("=" * 100)
+            logger.error(f"🚨 MILA BACKEND REJECTION: {e.reason}")
+            logger.error(
+                f"   Mila-reject attempt: "
+                f"{mila_reject_attempt}/{MAX_MILA_REJECTION_RETRIES}"
+            )
+            logger.error("=" * 100)
+
+            if mila_reject_attempt > MAX_MILA_REJECTION_RETRIES:
+                logger.error("=" * 100)
+                logger.error("❌ MILA BACKEND REJECTED TEST CONTENT - fail fast")
+                logger.error(
+                    f"   Exhausted {MAX_MILA_REJECTION_RETRIES} mila-reject retries — "
+                    f"test content appears to deterministically crash Mila's xi-deepchat API."
+                )
+                logger.error("   This is NOT a bot bug. Report the test case to the MILA team.")
+                logger.error("=" * 100)
+                print(f"\n{'='*100}")
+                print(f"❌ MILA BACKEND REJECTED CONTENT — fail fast")
+                print(f"   Retries exhausted: {mila_reject_attempt}/{MAX_MILA_REJECTION_RETRIES + 1}")
+                print(f"   This is a MILA backend bug, not a bot bug.")
+                print(f"{'='*100}\n")
+                # Sentinel line in stdout so run_test_executions.py (and anyone
+                # tailing logs) can distinguish "content crashed Mila" from
+                # "generic bridge failure" without parsing reason strings.
+                print("BRIDGE_FAILURE_REASON=mila_backend_rejection")
+                return [], 0
+
+            # Continue to next iteration (one retry to rule out transient blip)
+            continue
+
         except RestartTestRequired as e:
             restart_attempt += 1
             logger.error("=" * 100)
             logger.error(f"🚨 RESTART REQUIRED: {e.reason}")
-            logger.error(f"   Restart attempt: {restart_attempt}/{MAX_TEST_RESTARTS}")
+            logger.error(f"   General restart attempt: {restart_attempt}/{MAX_TEST_RESTARTS}")
             logger.error("=" * 100)
-            
+
             if restart_attempt > MAX_TEST_RESTARTS:
                 logger.error("❌ MAX RESTARTS EXCEEDED - TEST FAILED")
                 print(f"\n{'='*100}")
                 print(f"❌ MAX RESTARTS EXCEEDED ({MAX_TEST_RESTARTS})")
-                print(f"Test failed after {restart_attempt} attempts")
+                print(f"Test failed after {restart_attempt} general restart attempts")
                 print(f"{'='*100}\n")
+                print("BRIDGE_FAILURE_REASON=max_restarts_exceeded")
                 return [], 0
-            
+
             # Continue to next iteration (restart)
             continue
-            
+
         except Exception as e:
             # Other unexpected errors
             log_exception(logger, e, "run_bridge_with_restart")
@@ -1786,10 +1886,8 @@ def run_bridge_with_restart() -> Tuple[List[Dict[str, str]], int]:
             logger.error(f"   {e}")
             logger.error("=" * 100)
             print(f"\n❌ Unexpected error: {e}")
+            print("BRIDGE_FAILURE_REASON=unexpected_error")
             return [], 0
-    
-    # Should not reach here
-    return [], 0
 
 
 if __name__ == "__main__":
