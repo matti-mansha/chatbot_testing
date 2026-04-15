@@ -40,6 +40,17 @@ BRIDGE_SCRIPT = os.getenv("BRIDGE_SCRIPT", "playwright_bridge_bot_headless.py")
 # ✅ NEW: Check interval configuration
 CHECK_INTERVAL = int(os.getenv("EXECUTION_CHECK_INTERVAL", "10"))  # seconds
 
+# Status names used when updating the "Test Execution Status" field in Notion.
+# The evaluator queries strictly for `EXECUTION_SUCCESS_STATUS`, so anything else
+# is effectively "not ready for evaluation" — which is what we want for failures.
+#
+# By default, a failed bridge run leaves the row in "Test Execustion Started"
+# (matching the project's existing typo) so no Notion schema change is required.
+# If you add a "Test Execution Failed" option to the Notion DB, point this env
+# var at it for cleaner reporting.
+EXECUTION_SUCCESS_STATUS = os.getenv("EXECUTION_SUCCESS_STATUS", "Test Executed")
+EXECUTION_FAILED_STATUS = os.getenv("EXECUTION_FAILED_STATUS", "Test Execustion Started")
+
 # Notion API
 NOTION_API_BASE = "https://api.notion.com/v1"
 HEADERS = {
@@ -400,10 +411,11 @@ def run_playwright_bridge(
             text=True,
         )
         duration = time.time() - start_time
-        
+
+        bridge_failed = proc.returncode != 0
         logger.info(f"✓ Bridge script completed in {duration:.1f}s (exit code: {proc.returncode})")
-        
-        if proc.returncode != 0:
+
+        if bridge_failed:
             logger.error(f"   ❌ Bridge script exited with code {proc.returncode}")
             logger.debug(f"   stderr:\n{proc.stderr}")
             print(f"   ❌ Bridge script exited with code {proc.returncode}")
@@ -416,8 +428,21 @@ def run_playwright_bridge(
             conversation_text = f"(No stdout captured. stderr was:)\n\n{proc.stderr}"
             logger.warning("No stdout captured from bridge script")
 
+        # When the bridge failed, prefix the captured transcript with a clear
+        # failure banner so the conversation page we create for debugging is
+        # obviously not a normal run.
+        if bridge_failed:
+            failure_banner = (
+                "⚠️ BRIDGE FAILURE\n"
+                f"Exit code: {proc.returncode}\n"
+                f"Duration: {duration:.1f}s\n"
+                f"stderr (tail):\n{(proc.stderr or '')[-2000:]}\n"
+                "--- Partial transcript below (may be empty) ---\n\n"
+            )
+            conversation_text = failure_banner + conversation_text
+
         logger.debug(f"Captured conversation: {len(conversation_text)} chars")
-        
+
         number_of_turns = extract_turn_count_from_output(conversation_text)
         if number_of_turns is not None:
             logger.info(f"✓ Extracted turn count: {number_of_turns}")
@@ -431,13 +456,13 @@ def run_playwright_bridge(
             logger.info(f"✓ Extracted per-turn scores: {per_turn_scores}")
             print(f"   ✓ Per-turn scores: {per_turn_scores}")
 
-        return conversation_text, number_of_turns, per_turn_scores
+        return conversation_text, number_of_turns, per_turn_scores, bridge_failed
 
     except Exception as e:
         log_exception(logger, e, "run_playwright_bridge")
         logger.error(f"   ❌ Error running bridge script: {e}")
         print(f"   ❌ Error running bridge script: {e}")
-        return f"(Bridge error: {e})", None, None
+        return f"(Bridge error: {e})", None, None, True
 
 
 # =====================================
@@ -503,7 +528,7 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
 
     # Run the bridge
     start_ts = time.monotonic()
-    conversation_text, number_of_turns, per_turn_scores = run_playwright_bridge(
+    conversation_text, number_of_turns, per_turn_scores, bridge_failed = run_playwright_bridge(
         test_case_name=test_case_name,
         persona=persona,
         test_case_details=test_case_details,
@@ -527,8 +552,9 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
         import json as _json
         conversation_text += f"\n\n--- Per-turn completeness scores ---\n{_json.dumps(per_turn_scores)}"
 
-    # Create conversation page
-    conv_title = f"Conversation – {run_number or ''} – {test_case_name or page_id}"
+    # Create conversation page (always — even on failure it's useful for debugging)
+    failed_prefix = "[FAILED] " if bridge_failed else ""
+    conv_title = f"{failed_prefix}Conversation – {run_number or ''} – {test_case_name or page_id}"
     logger.info(f"Creating conversation page: {conv_title}")
 
     conv_page_id = create_formatted_conversation_page(
@@ -537,15 +563,35 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
         conversation_text=conversation_text,
     )
 
+    # Decide terminal status: success → EXECUTION_SUCCESS_STATUS ("Test Executed"),
+    # failure → EXECUTION_FAILED_STATUS (defaults to keeping it in the "Started"
+    # bucket so the evaluator doesn't pick it up and pollute KPIs).
+    if bridge_failed:
+        terminal_status = EXECUTION_FAILED_STATUS
+        logger.error(
+            f"   ❌ Bridge reported failure — leaving status as '{terminal_status}' "
+            f"(will NOT be evaluated). Conversation page saved for debugging."
+        )
+        print(
+            f"   ❌ Bridge reported failure — status kept as '{terminal_status}'. "
+            f"Conversation page saved for debugging."
+        )
+    else:
+        terminal_status = EXECUTION_SUCCESS_STATUS
+
     # Update execution row
     update_execution_row_with_results(
         execution_page_id=page_id,
-        status="Test Executed",
+        status=terminal_status,
         duration_seconds=duration,
         conversation_page_id=conv_page_id,
         number_of_turns=number_of_turns,
     )
-    
+
+    if bridge_failed:
+        logger.error(f"✗ Execution {page_id} failed (see conversation page for details)")
+        return False
+
     logger.info(f"✓ Execution {page_id} completed successfully")
     return True
 

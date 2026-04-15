@@ -1500,40 +1500,61 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                     logger.error("🚨 RestartTestRequired raised - propagating up")
                     raise
                     
-                except PlaywrightTimeoutError:
-                    # Regular timeout (no error, just slow)
+                except PlaywrightTimeoutError as e:
+                    # Mila did not respond in time — this is a REAL failure.
+                    # Previously this block silently `break`'d out of the loop, leaving
+                    # the outer harness to report the run as "COMPLETED SUCCESSFULLY" with
+                    # whatever partial turns had accumulated. That was poisoning KPIs with
+                    # 1-turn "conversations" where Mila never replied (see Issue #1 in the
+                    # fix list). Now we raise RestartTestRequired so the restart strategy
+                    # retries the test from scratch, and if MAX_TEST_RESTARTS is exceeded
+                    # the script exits non-zero and `run_test_executions.py` marks the
+                    # execution as failed rather than "Test Executed".
                     logger.error("❌ Mila did not reply (timeout)")
                     print("❌ Mila did not reply (timeout)")
-                    
+
                     diagnostics.capture_dom_snapshot(page_mila, f"10_turn{turn}_TIMEOUT")
                     diagnostics.detect_all_chat_elements(page_mila, f"turn{turn}_timeout")
-                    
+
                     error_state = diagnostics.check_for_errors(page_mila)
                     if error_state["has_errors"]:
                         logger.error(f"❌ Errors found during timeout!")
                         logger.error(f"   Error types: {error_state['error_types']}")
                         logger.error(f"   Error messages: {error_state['error_messages']}")
-                    
+
                     take_screenshot(page_mila, f"mila_timeout_turn{turn}")
-                    break
-                        
+                    raise RestartTestRequired(
+                        f"Mila did not reply within timeout on turn {turn} "
+                        f"(waited for new bubble / typing-complete); treating as failure."
+                    ) from e
+
                 except Exception as e:
                     log_exception(logger, e, "send_message_to_mila or wait")
                     logger.error(f"❌ Failed: {e}")
                     print(f"❌ Failed: {e}")
                     diagnostics.capture_dom_snapshot(page_mila, f"09_turn{turn}_FAILED")
                     take_screenshot(page_mila, f"failed_turn{turn}")
-                    break
+                    # Same rationale as the PlaywrightTimeoutError handler above: don't
+                    # mask errors with a silent break — escalate to a restart.
+                    raise RestartTestRequired(
+                        f"Unexpected error on turn {turn}: {type(e).__name__}: {e}"
+                    ) from e
 
                 # Extract Mila's response
                 mila_last = get_mila_last_message_text(page_mila, mila_sel)
-                
+
                 if not mila_last:
                     logger.error("❌ Failed to extract Mila's reply")
                     print("❌ Failed to extract Mila's reply")
                     diagnostics.capture_dom_snapshot(page_mila, f"11_turn{turn}_extraction_FAILED")
                     take_screenshot(page_mila, f"extraction_failed_turn{turn}")
-                    break
+                    # Empty reply = broken widget state (e.g. the "Calling RAG/Vector
+                    # Search" zombie state observed in the frontend). Restart the test
+                    # instead of pretending it succeeded.
+                    raise RestartTestRequired(
+                        f"Could not extract Mila's reply on turn {turn} "
+                        f"(widget likely in broken state)"
+                    )
                 
                 logger.info(f"✓ RECEIVED MILA'S REPLY (Turn {turn})")
                 logger.info(f"  Length: {len(mila_last)} chars")
