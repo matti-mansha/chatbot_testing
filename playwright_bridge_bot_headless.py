@@ -44,6 +44,55 @@ class RestartTestRequired(Exception):
         super().__init__(reason)
 
 
+# =====================================
+# MILA CHAT METADATA PARSING
+# =====================================
+# Per the MILA "Website chat - add chat metadata" spec, the LLM may append
+# a JSON metadata block wrapped in DOUBLE square brackets to its response,
+# e.g.:
+#
+#     Sure, here is how to do it. [short reply text]
+#     [[
+#       {"zielerreichung": 8, "risk_level": "low"}
+#     ]]
+#
+# The spec says the metadata must be STRIPPED before the reply reaches the
+# end user and kept separately for logging. For our test pipeline that
+# means two things:
+#   1. The tester bot (which generates the next user message) must receive
+#      the CLEAN version, otherwise it'll see the JSON and get confused.
+#   2. The metadata should still be captured and surfaced in the Notion
+#      conversation page so human reviewers (and KPI calculators) can see
+#      what Mila was self-reporting per turn.
+#
+# This helper finds the first [[ ... ]] block in the text, parses the
+# JSON inside, and returns (clean_text, metadata_dict). If no block is
+# found or the JSON is invalid, returns (original_text, {}).
+_MILA_METADATA_RE = re.compile(r"\[\[\s*(\{.*?\})\s*\]\]", re.DOTALL)
+
+
+def strip_mila_metadata(text: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Strip a trailing [[{...}]] metadata block from a Mila reply.
+
+    Returns (clean_text, metadata_dict). metadata_dict is empty when the
+    block is missing or the JSON inside isn't parseable. Never raises.
+    """
+    if not text:
+        return text or "", {}
+    m = _MILA_METADATA_RE.search(text)
+    if not m:
+        return text, {}
+    try:
+        meta = json.loads(m.group(1))
+        if not isinstance(meta, dict):
+            return text, {}
+    except Exception:
+        return text, {}
+    cleaned = _MILA_METADATA_RE.sub("", text).strip()
+    return cleaned, meta
+
+
 class MilaBackendRejection(RestartTestRequired):
     """
     Raised when Mila's backend itself crashes ("something went terribly
@@ -1540,6 +1589,16 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                 browser.close()
                 return CONVERSATION_LOG, turns_completed
             
+            # Strip any [[{...}]] metadata block Mila may append per the
+            # "Website chat - add chat metadata" spec. The clean version is
+            # what we show the tester bot and persist in the transcript;
+            # the raw metadata is logged separately for KPI + debugging.
+            mila_last, mila_meta = strip_mila_metadata(mila_last)
+            if mila_meta:
+                meta_json = json.dumps(mila_meta, ensure_ascii=False)
+                logger.info(f"🏷️ Mila metadata (first message): {meta_json}")
+                print(f"🏷️ Mila metadata: {meta_json}")
+
             logger.info("✓ RECEIVED MILA'S FIRST MESSAGE")
             logger.info(f"  Length: {len(mila_last)} chars")
             logger.info(f"  Content: {mila_last[:200]}...")
@@ -1704,6 +1763,17 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                         f"(widget likely in broken state)"
                     )
                 
+                # Strip + capture any [[{...}]] metadata block per the
+                # "Website chat - add chat metadata" spec. Clean text goes
+                # to the tester bot and to the transcript; metadata is
+                # logged to stdout so format_conversation_page can render it
+                # as part of the Mila message in Notion.
+                mila_last, mila_meta = strip_mila_metadata(mila_last)
+                if mila_meta:
+                    meta_json = json.dumps(mila_meta, ensure_ascii=False)
+                    logger.info(f"🏷️ Mila metadata (Turn {turn}): {meta_json}")
+                    print(f"🏷️ Mila metadata: {meta_json}")
+
                 logger.info(f"✓ RECEIVED MILA'S REPLY (Turn {turn})")
                 logger.info(f"  Length: {len(mila_last)} chars")
                 logger.info(f"  Content: {mila_last[:200]}...")

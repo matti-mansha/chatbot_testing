@@ -1371,6 +1371,29 @@ def _score_color(score: Optional[float]) -> str:
 
 
 def render_kpis_tab() -> None:
+    """
+    Render the full 14-KPI dashboard, organized by the same taxonomy as
+    calculate_kpis.py (Quality / Efficiency / Consistency / Topic-Level):
+
+        Quality (6):
+            1. Overall Pass Rate
+            2. Average Evaluation Score
+            3. Score Distribution
+            4. Weakest KPI per Run (+ 9 rubric dimensions chart)
+            5. Safety Compliance Rate
+            6. Support Workflow Compliance Rate
+        Efficiency (5):
+            7. Avg Turns to Resolution
+            8. Avg Conversation Duration
+            9. Overstaying Rate
+            10. Completeness Velocity
+            11. Premature Ending Rate
+        Consistency (1):
+            12. Persona Fairness Gap
+        Topic-Level (2):
+            13. Worst 5 Test Cases
+            14. Best 5 Test Cases
+    """
     if not HAS_KPI_CALC:
         st.error(
             "KPI computation module (calculate_kpis.py) could not be imported. "
@@ -1420,7 +1443,9 @@ def render_kpis_tab() -> None:
     num_evaluated = payload["num_evaluated"]
     progress_pct = (num_evaluated / num_total * 100) if num_total else 0.0
 
-    # --- Scorecard strip ----------------------------------------------------
+    # =======================================================================
+    # Scorecard strip (headline metrics)
+    # =======================================================================
     avg_score_info = kpis.get("avg_score", {}) or {}
     avg_score = avg_score_info.get("value")
     pass_rate_info = kpis.get("pass_rate", {}) or {}
@@ -1460,18 +1485,26 @@ def render_kpis_tab() -> None:
         </div>
     """)
 
-    # --- Row: 9-KPI bar chart (left) + score distribution donut (right) ----
+    # =======================================================================
+    # A) QUALITY KPIs (6)
+    # =======================================================================
+    st.markdown("## 📊 A) Quality KPIs (6)")
+    st.caption(
+        "1. Pass Rate · 2. Avg Score · 3. Score Distribution · "
+        "4. Weakest KPI · 5. Safety Compliance · 6. Workflow Compliance"
+    )
+
     col_bar, col_donut = st.columns([7, 5], gap="large")
 
     with col_bar:
-        st.markdown("### 🎯 KPI breakdown — 9 dimensions")
-        kpi_rows = []
+        st.markdown("#### 4. Weakest KPI per Run — 9-dimension rubric breakdown")
         kpi_scores_all: Dict[str, List[int]] = {}
         for d in data:
             for kpi_name, score in (d.get("kpis") or {}).items():
                 if score is not None:
                     kpi_scores_all.setdefault(kpi_name, []).append(int(score))
         if kpi_scores_all:
+            kpi_rows = []
             for kpi_name in kpi_calc.KPI_NAMES:
                 scores = kpi_scores_all.get(kpi_name, [])
                 avg = sum(scores) / len(scores) if scores else 0.0
@@ -1513,11 +1546,10 @@ def render_kpis_tab() -> None:
             st.info("No detailed KPI data available. Evaluator hasn't produced results yet.")
 
     with col_donut:
-        st.markdown("### 📊 Score distribution")
+        st.markdown("#### 3. Score Distribution")
         dist_info = kpis.get("score_distribution", {}) or {}
         dist_val = dist_info.get("value")
         if dist_val and isinstance(dist_val, dict):
-            band_rows = []
             band_order = [
                 "Excellent (81-100)",
                 "Good (61-80)",
@@ -1525,9 +1557,9 @@ def render_kpis_tab() -> None:
                 "Poor (1-40)",
             ]
             band_colors = ["#4ade80", "#a3e635", "#facc15", "#f87171"]
+            band_rows = []
             for band in band_order:
                 val_str = dist_val.get(band, "0/0 (0%)")
-                # Parse "N/total (X%)" → N
                 m = re.match(r"(\d+)/", str(val_str))
                 count = int(m.group(1)) if m else 0
                 band_rows.append({"band": band, "count": count})
@@ -1556,80 +1588,226 @@ def render_kpis_tab() -> None:
         else:
             st.info("No score distribution data.")
 
-    # --- Efficiency strip ---------------------------------------------------
-    st.markdown("### ⚡ Efficiency")
-    eff_cols = st.columns(4)
+    # --- KPIs 5 & 6: Safety + Workflow compliance (specialized rates) ------
+    safety_info = kpis.get("safety_compliance", {}) or {}
+    workflow_info = kpis.get("workflow_compliance", {}) or {}
+    safety_val = safety_info.get("value")
+    workflow_val = workflow_info.get("value")
+    safety_detail = safety_info.get("detail", "—")
+    workflow_detail = workflow_info.get("detail", "—")
+
+    def _fmt_pct_or_na(v: Any) -> str:
+        if v is None or v == "N/A":
+            return "N/A"
+        return f"{v}%"
+
+    safety_color = _score_color(safety_val if isinstance(safety_val, (int, float)) else None)
+    workflow_color = _score_color(workflow_val if isinstance(workflow_val, (int, float)) else None)
+
+    html(f"""
+        <div class="metric-strip" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="metric-cell">
+        <div class="metric-label">5. Safety Compliance Rate</div>
+        <div class="metric-value" style="color:{safety_color};">{_fmt_pct_or_na(safety_val)}</div>
+        <div class="metric-sub">{_escape(safety_detail)}</div>
+        </div>
+        <div class="metric-cell">
+        <div class="metric-label">6. Support Workflow Compliance Rate</div>
+        <div class="metric-value" style="color:{workflow_color};">{_fmt_pct_or_na(workflow_val)}</div>
+        <div class="metric-sub">{_escape(workflow_detail)}</div>
+        </div>
+        </div>
+    """)
+
+    # =======================================================================
+    # B) EFFICIENCY KPIs (5)
+    # =======================================================================
+    st.markdown("## ⚡ B) Efficiency KPIs (5)")
+    st.caption(
+        "7. Avg Turns · 8. Avg Duration · 9. Overstaying Rate · "
+        "10. Completeness Velocity · 11. Premature Ending Rate"
+    )
+
+    eff_cols = st.columns(5)
     with eff_cols[0]:
         v = kpis.get("avg_turns", {}) or {}
-        st.metric("Avg turns", f"{v.get('value','—')}", help=v.get("detail", ""))
+        st.metric("7. Avg turns", f"{v.get('value','—')}", help=v.get("detail", ""))
     with eff_cols[1]:
         v = kpis.get("avg_duration", {}) or {}
         val = v.get("value")
         disp = human_duration(val) if val is not None else "—"
-        st.metric("Avg duration", disp, help=v.get("detail", ""))
+        st.metric("8. Avg duration", disp, help=v.get("detail", ""))
     with eff_cols[2]:
         v = kpis.get("overstaying_rate", {}) or {}
         val = v.get("value")
-        st.metric("Overstaying rate", f"{val}%" if val is not None else "—", help=v.get("detail", ""))
+        st.metric(
+            "9. Overstaying rate",
+            f"{val}%" if val is not None else "—",
+            help=v.get("detail", ""),
+        )
     with eff_cols[3]:
+        v = kpis.get("completeness_velocity", {}) or {}
+        val = v.get("value")
+        if isinstance(val, (int, float)):
+            disp = f"{val:+.1f} pts/turn"
+        else:
+            disp = "N/A"
+        st.metric(
+            "10. Completeness velocity",
+            disp,
+            help=v.get("detail", ""),
+        )
+    with eff_cols[4]:
         v = kpis.get("premature_ending_rate", {}) or {}
         val = v.get("value")
-        st.metric("Premature endings", f"{val}%" if val is not None else "—", help=v.get("detail", ""))
+        st.metric(
+            "11. Premature endings",
+            f"{val}%" if val is not None else "—",
+            help=v.get("detail", ""),
+        )
 
-    # --- Persona fairness callout ------------------------------------------
+    # =======================================================================
+    # C) CONSISTENCY KPI (1) — Persona Fairness Gap
+    # =======================================================================
+    st.markdown("## 🔄 C) Consistency KPI (1)")
+    st.caption("12. Persona Fairness Gap")
     pf = kpis.get("persona_fairness", {}) or {}
     pf_val = pf.get("value")
-    if pf_val is not None and pf_val > 10:
-        st.warning(
-            f"⚖️ **Persona fairness gap: {pf_val} points** — "
-            f"{pf.get('detail', '')}. Worth investigating if MILA is biased by persona."
-        )
-    elif pf_val is not None:
-        st.success(
-            f"⚖️ Persona fairness gap: {pf_val} points — no significant bias detected."
-        )
-
-    # --- Per-test-case leaderboard -----------------------------------------
-    st.markdown("### 📋 Per-test-case results (sorted by score)")
-    rows = []
-    for d in data:
-        score = d.get("overall_score")
-        result = d.get("result") or "—"
-        rows.append(
-            {
-                "Score": round(score, 1) if score is not None else None,
-                "Result": result,
-                "Run": d.get("run_number", ""),
-                "Test case": (d.get("test_case_name") or "")[:60],
-                "Persona": (d.get("persona") or "")[:40],
-                "Turns": d.get("num_turns"),
-                "Duration": human_duration(d.get("duration")) if d.get("duration") else "—",
-            }
-        )
-    if rows:
-        leaderboard = pd.DataFrame(rows).sort_values(
-            "Score", ascending=True, na_position="last"
-        )
-        st.dataframe(
-            leaderboard,
-            use_container_width=True,
-            hide_index=True,
-            height=min(600, 50 + 36 * len(leaderboard)),
-            column_config={
-                "Score": st.column_config.ProgressColumn(
-                    "Score",
-                    format="%.0f",
-                    min_value=0,
-                    max_value=100,
-                ),
-            },
-        )
+    pf_groups = pf.get("groups") or {}
+    if isinstance(pf_val, (int, float)):
+        if pf_val > 10:
+            st.warning(
+                f"⚖️ **12. Persona fairness gap: {pf_val} points** — "
+                f"{pf.get('detail', '')}. MILA scores noticeably different across "
+                f"persona groups — possible bias worth investigating."
+            )
+        else:
+            st.success(
+                f"⚖️ **12. Persona fairness gap: {pf_val} points** — "
+                f"{pf.get('detail', '')} — no significant bias detected."
+            )
+        # Bar chart of persona group averages
+        if pf_groups:
+            pf_df = pd.DataFrame(
+                [{"group": g, "avg": s} for g, s in pf_groups.items()]
+            )
+            pf_chart = (
+                alt.Chart(pf_df)
+                .mark_bar(cornerRadius=4)
+                .encode(
+                    x=alt.X("avg:Q", title="Avg score", scale=alt.Scale(domain=[0, 100])),
+                    y=alt.Y("group:N", sort="-x", title=None),
+                    color=alt.Color(
+                        "avg:Q",
+                        scale=alt.Scale(
+                            domain=[0, 40, 60, 80, 100],
+                            range=["#f87171", "#fb923c", "#facc15", "#a3e635", "#4ade80"],
+                        ),
+                        legend=None,
+                    ),
+                    tooltip=["group", "avg"],
+                )
+                .properties(height=110)
+            )
+            st.altair_chart(pf_chart, use_container_width=True)
     else:
-        st.info("No completed evaluations yet.")
+        st.info("12. Persona fairness gap — need at least 2 persona groups to compare.")
 
-    # --- Historical trend across test runs ---------------------------------
+    # =======================================================================
+    # D) TOPIC-LEVEL KPIs (2) — Worst + Best 5 test cases
+    # =======================================================================
+    st.markdown("## 🎯 D) Topic-Level KPIs (2)")
+    st.caption("13. Worst 5 Test Cases · 14. Best 5 Test Cases")
+
+    worst_info = kpis.get("worst_test_cases", {}) or {}
+    best_info = kpis.get("best_test_cases", {}) or {}
+    worst_tcs = worst_info.get("value") or []
+    best_tcs = best_info.get("value") or []
+
+    col_worst, col_best = st.columns(2, gap="large")
+    with col_worst:
+        st.markdown("#### 13. Worst 5 (priority fix list)")
+        if worst_tcs:
+            worst_df = pd.DataFrame(
+                [{"Score": s, "Test case": n[:60]} for n, s in worst_tcs]
+            )
+            st.dataframe(
+                worst_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score", format="%.0f", min_value=0, max_value=100
+                    ),
+                },
+            )
+        else:
+            st.info("No data yet.")
+
+    with col_best:
+        st.markdown("#### 14. Best 5 (strengths)")
+        if best_tcs:
+            best_df = pd.DataFrame(
+                [{"Score": s, "Test case": n[:60]} for n, s in best_tcs]
+            )
+            st.dataframe(
+                best_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score", format="%.0f", min_value=0, max_value=100
+                    ),
+                },
+            )
+        else:
+            st.info("No data yet.")
+
+    # =======================================================================
+    # Full per-test-case leaderboard (for deeper inspection)
+    # =======================================================================
+    with st.expander("📋 All evaluated executions (sortable)", expanded=False):
+        rows = []
+        for d in data:
+            score = d.get("overall_score")
+            result = d.get("result") or "—"
+            rows.append(
+                {
+                    "Score": round(score, 1) if score is not None else None,
+                    "Result": result,
+                    "Run": d.get("run_number", ""),
+                    "Test case": (d.get("test_case_name") or "")[:60],
+                    "Persona": (d.get("persona") or "")[:40],
+                    "Turns": d.get("num_turns"),
+                    "Duration": human_duration(d.get("duration")) if d.get("duration") else "—",
+                }
+            )
+        if rows:
+            leaderboard = pd.DataFrame(rows).sort_values(
+                "Score", ascending=True, na_position="last"
+            )
+            st.dataframe(
+                leaderboard,
+                use_container_width=True,
+                hide_index=True,
+                height=min(600, 50 + 36 * len(leaderboard)),
+                column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score",
+                        format="%.0f",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                },
+            )
+        else:
+            st.info("No completed evaluations yet.")
+
+    # =======================================================================
+    # Historical trend across test runs
+    # =======================================================================
     if len(runs) > 1:
-        st.markdown("### 📈 Historical trend (avg score across test runs)")
+        st.markdown("## 📈 Historical trend (avg score across test runs)")
         hist_df = pd.DataFrame(
             [
                 {"run": r[0], "avg_score": r[2], "evals": r[3]}
