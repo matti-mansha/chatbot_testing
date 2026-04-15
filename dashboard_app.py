@@ -47,6 +47,16 @@ import streamlit as st
 import streamlit.components.v1 as components
 import textwrap
 
+# Reuse the KPI-computation machinery from calculate_kpis.py instead of
+# reimplementing anything. All the calc_* functions are top-level and
+# importable. This gives us a single source of truth for KPI math so
+# the dashboard view and the CLI report stay in sync.
+try:
+    import calculate_kpis as kpi_calc  # noqa: E402
+    HAS_KPI_CALC = True
+except Exception:
+    HAS_KPI_CALC = False
+
 
 def html(raw: str) -> None:
     """
@@ -1251,6 +1261,396 @@ def render_log_tail() -> None:
     st.markdown(f'<div class="log-box">{body}</div>', unsafe_allow_html=True)
 
 
+# =============================================================================
+# KPI TAB
+# =============================================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _kpi_test_runs() -> List[Tuple[str, str, float, int, int, Optional[str]]]:
+    """
+    Return a list of test runs that have at least one evaluated execution.
+    Each tuple: (run_prefix, run_title, avg_score_or_0, num_evals, num_total, status).
+    The dashboard uses this for the run selector.
+
+    Cached for 60s so the selector doesn't re-query Notion on every tick.
+    """
+    if not HAS_KPI_CALC:
+        return []
+    try:
+        test_runs_db_id = kpi_calc.find_database_in_page(kpi_calc.TEST_RUNS_PAGE_ID)
+        if not test_runs_db_id:
+            return []
+        rows = kpi_calc.notion_query_all(test_runs_db_id)
+    except Exception:
+        return []
+
+    result: List[Tuple[str, str, float, int, int, Optional[str]]] = []
+    for row in rows:
+        props = row.get("properties", {})
+        # "Test Run Number" is the title property
+        title = ""
+        for p in props.values():
+            if p.get("type") == "title":
+                title = "".join(c.get("plain_text", "") for c in p.get("title", []))
+                break
+        if not title:
+            continue
+        score = kpi_calc.extract_property_value(row, "Score") or 0
+        num_evals = int(kpi_calc.extract_property_value(row, "Number of evaluations") or 0)
+        num_total = int(kpi_calc.extract_property_value(row, "Total number of test cases") or 0)
+        status = kpi_calc.extract_property_value(row, "Status")
+        result.append((title, title, float(score), num_evals, num_total, status))
+
+    # Sort newest-ish first (by title descending works for "TR1", "TR2", ...)
+    result.sort(key=lambda t: t[0], reverse=True)
+    return result
+
+
+@st.cache_data(ttl=60, show_spinner="Fetching KPIs from Notion…")
+def _kpi_payload_for_run(run_prefix: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch + aggregate all KPIs for the given test run, reusing
+    calculate_kpis.py's aggregation functions. Cached for 60s so a 28-test
+    run's 28 Notion page fetches only happen once a minute.
+
+    Returns a dict with:
+      * raw_data: list of per-execution dicts (with detail KPIs)
+      * kpis: dict of all aggregate KPIs (pass_rate, avg_score, etc.)
+      * num_evaluated: int
+    Or None if nothing to show.
+    """
+    if not HAS_KPI_CALC:
+        return None
+    try:
+        test_exec_db_id = kpi_calc.find_database_in_page(
+            kpi_calc.TEST_CASE_EXECUTIONS_PAGE_ID
+        )
+        if not test_exec_db_id:
+            return None
+        executions = kpi_calc.get_evaluated_executions(test_exec_db_id, run_prefix)
+        if not executions:
+            return None
+        data = kpi_calc.collect_execution_data(executions, fetch_kpi_details=True)
+        kpis = {
+            "pass_rate":             kpi_calc.calc_pass_rate(data),
+            "avg_score":             kpi_calc.calc_avg_score(data),
+            "score_distribution":    kpi_calc.calc_score_distribution(data),
+            "weakest_kpi":           kpi_calc.calc_weakest_kpi(data),
+            "safety_compliance":     kpi_calc.calc_safety_compliance(data),
+            "workflow_compliance":   kpi_calc.calc_workflow_compliance(data),
+            "avg_turns":             kpi_calc.calc_avg_turns(data),
+            "avg_duration":          kpi_calc.calc_avg_duration(data),
+            "overstaying_rate":      kpi_calc.calc_overstaying_rate(data),
+            "completeness_velocity": kpi_calc.calc_completeness_velocity(data),
+            "premature_ending_rate": kpi_calc.calc_premature_ending_rate(data),
+            "persona_fairness":      kpi_calc.calc_persona_fairness(data),
+            "worst_test_cases":      kpi_calc.calc_worst_test_cases(data),
+            "best_test_cases":       kpi_calc.calc_best_test_cases(data),
+        }
+        return {
+            "run_prefix": run_prefix,
+            "num_evaluated": len(data),
+            "raw_data": data,
+            "kpis": kpis,
+        }
+    except Exception as e:
+        st.error(f"Failed to fetch KPIs for {run_prefix}: {e}")
+        return None
+
+
+def _score_color(score: Optional[float]) -> str:
+    if score is None:
+        return "#6b7280"
+    if score >= 80:
+        return "#4ade80"
+    if score >= 60:
+        return "#facc15"
+    if score >= 40:
+        return "#fb923c"
+    return "#f87171"
+
+
+def render_kpis_tab() -> None:
+    if not HAS_KPI_CALC:
+        st.error(
+            "KPI computation module (calculate_kpis.py) could not be imported. "
+            "The KPI tab is unavailable."
+        )
+        return
+
+    runs = _kpi_test_runs()
+    if not runs:
+        st.info(
+            "No test runs with evaluated executions found yet. Trigger a run "
+            "from Notion and wait for the evaluator to produce results."
+        )
+        return
+
+    # --- Run selector -------------------------------------------------------
+    run_labels = [
+        f"{r[0]} · {r[3]}/{r[4]} evals · avg {r[2]:.1f}/100"
+        for r in runs
+    ]
+    sel_col, btn_col = st.columns([4, 1])
+    with sel_col:
+        sel_idx = st.selectbox(
+            "Test run",
+            options=list(range(len(runs))),
+            format_func=lambda i: run_labels[i],
+            index=0,
+            key="kpi_run_select",
+        )
+    with btn_col:
+        if st.button("🔄 Refresh KPIs", use_container_width=True, key="kpi_refresh"):
+            _kpi_payload_for_run.clear()
+            _kpi_test_runs.clear()
+            st.rerun()
+
+    run_prefix = runs[sel_idx][0]
+    run_status = runs[sel_idx][5] or "—"
+    num_total = runs[sel_idx][4]
+
+    payload = _kpi_payload_for_run(run_prefix)
+    if not payload:
+        st.warning(f"No evaluated executions for {run_prefix} yet.")
+        return
+
+    kpis = payload["kpis"]
+    data = payload["raw_data"]
+    num_evaluated = payload["num_evaluated"]
+    progress_pct = (num_evaluated / num_total * 100) if num_total else 0.0
+
+    # --- Scorecard strip ----------------------------------------------------
+    avg_score_info = kpis.get("avg_score", {}) or {}
+    avg_score = avg_score_info.get("value")
+    pass_rate_info = kpis.get("pass_rate", {}) or {}
+    pass_rate = pass_rate_info.get("value")
+    weakest = kpis.get("weakest_kpi", {}) or {}
+    weakest_name = (weakest.get("value") or "").replace("_", " ").title() if weakest.get("value") else "—"
+    weakest_score = weakest.get("score")
+
+    avg_score_color = _score_color(avg_score)
+    pass_rate_color = _score_color(pass_rate)
+
+    pass_detail = pass_rate_info.get("detail", "—")
+    avg_detail = avg_score_info.get("detail", "—")
+
+    html(f"""
+        <div class="metric-strip">
+        <div class="metric-cell">
+        <div class="metric-label">Avg score</div>
+        <div class="metric-value" style="color:{avg_score_color};">{avg_score if avg_score is not None else '—'}</div>
+        <div class="metric-sub">{_escape(avg_detail)}</div>
+        </div>
+        <div class="metric-cell">
+        <div class="metric-label">Pass rate</div>
+        <div class="metric-value" style="color:{pass_rate_color};">{str(pass_rate) + '%' if pass_rate is not None else '—'}</div>
+        <div class="metric-sub">{_escape(pass_detail)}</div>
+        </div>
+        <div class="metric-cell">
+        <div class="metric-label">Progress</div>
+        <div class="metric-value">{num_evaluated}<span style="color:#6b7280; font-size:16px;"> / {num_total}</span></div>
+        <div class="metric-sub">{progress_pct:.0f}% evaluated · status: {_escape(run_status)}</div>
+        </div>
+        <div class="metric-cell">
+        <div class="metric-label">Weakest KPI</div>
+        <div class="metric-value" style="font-size:16px; color:#f87171;">{_escape(weakest_name)}</div>
+        <div class="metric-sub">{f'{weakest_score:.1f}/100' if weakest_score is not None else '—'}</div>
+        </div>
+        </div>
+    """)
+
+    # --- Row: 9-KPI bar chart (left) + score distribution donut (right) ----
+    col_bar, col_donut = st.columns([7, 5], gap="large")
+
+    with col_bar:
+        st.markdown("### 🎯 KPI breakdown — 9 dimensions")
+        kpi_rows = []
+        kpi_scores_all: Dict[str, List[int]] = {}
+        for d in data:
+            for kpi_name, score in (d.get("kpis") or {}).items():
+                if score is not None:
+                    kpi_scores_all.setdefault(kpi_name, []).append(int(score))
+        if kpi_scores_all:
+            for kpi_name in kpi_calc.KPI_NAMES:
+                scores = kpi_scores_all.get(kpi_name, [])
+                avg = sum(scores) / len(scores) if scores else 0.0
+                kpi_rows.append(
+                    {
+                        "kpi": kpi_name.replace("_", " ").title(),
+                        "avg": round(avg, 1),
+                        "n": len(scores),
+                    }
+                )
+            df = pd.DataFrame(kpi_rows).sort_values("avg", ascending=True)
+            chart = (
+                alt.Chart(df)
+                .mark_bar(cornerRadius=4, height=22)
+                .encode(
+                    x=alt.X("avg:Q", title="Average score", scale=alt.Scale(domain=[0, 100])),
+                    y=alt.Y("kpi:N", sort="-x", title=None),
+                    color=alt.Color(
+                        "avg:Q",
+                        scale=alt.Scale(
+                            domain=[0, 40, 60, 80, 100],
+                            range=["#f87171", "#fb923c", "#facc15", "#a3e635", "#4ade80"],
+                        ),
+                        legend=None,
+                    ),
+                    tooltip=["kpi", "avg", "n"],
+                )
+                .properties(height=320)
+            )
+            text = (
+                alt.Chart(df)
+                .mark_text(
+                    align="left", baseline="middle", dx=4, fontSize=11, color="#f3f4f6"
+                )
+                .encode(x="avg:Q", y=alt.Y("kpi:N", sort="-x"), text="avg:Q")
+            )
+            st.altair_chart(chart + text, use_container_width=True)
+        else:
+            st.info("No detailed KPI data available. Evaluator hasn't produced results yet.")
+
+    with col_donut:
+        st.markdown("### 📊 Score distribution")
+        dist_info = kpis.get("score_distribution", {}) or {}
+        dist_val = dist_info.get("value")
+        if dist_val and isinstance(dist_val, dict):
+            band_rows = []
+            band_order = [
+                "Excellent (81-100)",
+                "Good (61-80)",
+                "Acceptable (41-60)",
+                "Poor (1-40)",
+            ]
+            band_colors = ["#4ade80", "#a3e635", "#facc15", "#f87171"]
+            for band in band_order:
+                val_str = dist_val.get(band, "0/0 (0%)")
+                # Parse "N/total (X%)" → N
+                m = re.match(r"(\d+)/", str(val_str))
+                count = int(m.group(1)) if m else 0
+                band_rows.append({"band": band, "count": count})
+            band_df = pd.DataFrame(band_rows)
+            if band_df["count"].sum() > 0:
+                donut = (
+                    alt.Chart(band_df)
+                    .mark_arc(
+                        innerRadius=55, outerRadius=95, stroke="#0e1117", strokeWidth=2
+                    )
+                    .encode(
+                        theta=alt.Theta("count:Q", stack=True),
+                        color=alt.Color(
+                            "band:N",
+                            scale=alt.Scale(domain=band_order, range=band_colors),
+                            legend=alt.Legend(orient="right", title=None),
+                            sort=band_order,
+                        ),
+                        tooltip=["band", "count"],
+                    )
+                    .properties(height=260)
+                )
+                st.altair_chart(donut, use_container_width=True)
+            else:
+                st.info("No scores yet.")
+        else:
+            st.info("No score distribution data.")
+
+    # --- Efficiency strip ---------------------------------------------------
+    st.markdown("### ⚡ Efficiency")
+    eff_cols = st.columns(4)
+    with eff_cols[0]:
+        v = kpis.get("avg_turns", {}) or {}
+        st.metric("Avg turns", f"{v.get('value','—')}", help=v.get("detail", ""))
+    with eff_cols[1]:
+        v = kpis.get("avg_duration", {}) or {}
+        val = v.get("value")
+        disp = human_duration(val) if val is not None else "—"
+        st.metric("Avg duration", disp, help=v.get("detail", ""))
+    with eff_cols[2]:
+        v = kpis.get("overstaying_rate", {}) or {}
+        val = v.get("value")
+        st.metric("Overstaying rate", f"{val}%" if val is not None else "—", help=v.get("detail", ""))
+    with eff_cols[3]:
+        v = kpis.get("premature_ending_rate", {}) or {}
+        val = v.get("value")
+        st.metric("Premature endings", f"{val}%" if val is not None else "—", help=v.get("detail", ""))
+
+    # --- Persona fairness callout ------------------------------------------
+    pf = kpis.get("persona_fairness", {}) or {}
+    pf_val = pf.get("value")
+    if pf_val is not None and pf_val > 10:
+        st.warning(
+            f"⚖️ **Persona fairness gap: {pf_val} points** — "
+            f"{pf.get('detail', '')}. Worth investigating if MILA is biased by persona."
+        )
+    elif pf_val is not None:
+        st.success(
+            f"⚖️ Persona fairness gap: {pf_val} points — no significant bias detected."
+        )
+
+    # --- Per-test-case leaderboard -----------------------------------------
+    st.markdown("### 📋 Per-test-case results (sorted by score)")
+    rows = []
+    for d in data:
+        score = d.get("overall_score")
+        result = d.get("result") or "—"
+        rows.append(
+            {
+                "Score": round(score, 1) if score is not None else None,
+                "Result": result,
+                "Run": d.get("run_number", ""),
+                "Test case": (d.get("test_case_name") or "")[:60],
+                "Persona": (d.get("persona") or "")[:40],
+                "Turns": d.get("num_turns"),
+                "Duration": human_duration(d.get("duration")) if d.get("duration") else "—",
+            }
+        )
+    if rows:
+        leaderboard = pd.DataFrame(rows).sort_values(
+            "Score", ascending=True, na_position="last"
+        )
+        st.dataframe(
+            leaderboard,
+            use_container_width=True,
+            hide_index=True,
+            height=min(600, 50 + 36 * len(leaderboard)),
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score",
+                    format="%.0f",
+                    min_value=0,
+                    max_value=100,
+                ),
+            },
+        )
+    else:
+        st.info("No completed evaluations yet.")
+
+    # --- Historical trend across test runs ---------------------------------
+    if len(runs) > 1:
+        st.markdown("### 📈 Historical trend (avg score across test runs)")
+        hist_df = pd.DataFrame(
+            [
+                {"run": r[0], "avg_score": r[2], "evals": r[3]}
+                for r in runs
+                if r[2] > 0
+            ]
+        )
+        if not hist_df.empty:
+            line = (
+                alt.Chart(hist_df)
+                .mark_line(point=True, strokeWidth=3, color="#60a5fa")
+                .encode(
+                    x=alt.X("run:N", title="Test run", sort=None),
+                    y=alt.Y("avg_score:Q", title="Avg score", scale=alt.Scale(domain=[0, 100])),
+                    tooltip=["run", "avg_score", "evals"],
+                )
+                .properties(height=220)
+            )
+            st.altair_chart(line, use_container_width=True)
+
+
 def render_services_tab(svc_state: Dict[str, Dict[str, Any]]) -> None:
     rows = []
     for name, info in svc_state.items():
@@ -1348,8 +1748,8 @@ def main() -> None:
     render_hero(svc)
     render_metric_strip(svc)
 
-    tab_live, tab_logs, tab_failures, tab_services = st.tabs(
-        ["🚀 Live", "📝 Logs", "⚠️ Failures", "⚙️ Services"]
+    tab_live, tab_kpis, tab_logs, tab_failures, tab_services = st.tabs(
+        ["🚀 Live", "📊 KPIs", "📝 Logs", "⚠️ Failures", "⚙️ Services"]
     )
 
     records = parse_recent_executions()
@@ -1363,6 +1763,9 @@ def main() -> None:
             render_outcomes_donut(records)
             st.markdown("### 📜 Recent executions")
             render_recent_history(records)
+
+    with tab_kpis:
+        render_kpis_tab()
 
     with tab_logs:
         render_log_tail()
