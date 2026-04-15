@@ -406,11 +406,19 @@ def service_state() -> Dict[str, Dict[str, Any]]:
 
 
 def bridge_process() -> Optional[Dict[str, str]]:
-    """Return info about the currently-running playwright bridge subprocess."""
+    """Return info about the first running playwright bridge subprocess (legacy)."""
+    bridges = bridge_processes()
+    return bridges[0] if bridges else None
+
+
+def bridge_processes() -> List[Dict[str, str]]:
+    """Return ALL currently-running playwright bridge subprocesses (one per
+    parallel worker in the execution pool)."""
+    found: List[Dict[str, str]] = []
     for p in ps_processes():
         if "playwright_bridge_bot_headless.py" in p["cmd"] and "grep" not in p["cmd"]:
-            return p
-    return None
+            found.append(p)
+    return found
 
 
 LOG_LINE_RE = re.compile(
@@ -768,13 +776,14 @@ def render_hero(svc_state: Dict[str, Dict[str, Any]]) -> None:
             f'<div class="status-pill"><span class="status-dot {dot}"></span>'
             f'{name}<span class="muted">· {etime}</span></div>'
         )
-    bridge = bridge_process()
+    # One pill per running bridge (there may be multiple in parallel mode)
     bridge_pill = ""
-    if bridge:
-        bridge_pill = (
+    bridges = bridge_processes()
+    for b in bridges:
+        bridge_pill += (
             f'<div class="status-pill" style="background: rgba(96,165,250,0.12); border-color: rgba(96,165,250,0.3);">'
             f'<span class="status-dot dot-alive" style="background:#60a5fa;"></span>'
-            f'bridge PID {bridge["pid"]}<span class="muted">· {bridge["etime"]}</span></div>'
+            f'bridge {b["pid"]}<span class="muted">· {b["etime"]}</span></div>'
         )
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     now_local = datetime.now().strftime("%H:%M:%S")
@@ -841,8 +850,13 @@ def _escape(text: str) -> str:
     return (text or "").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def render_bridge_card(status: BridgeStatus) -> None:
-    if not status.running:
+def render_bridge_cards() -> None:
+    """
+    Render one card per running bridge process (parallel mode).
+    Falls back to a single "pipeline idle" card if nothing is running.
+    """
+    bridges = bridge_processes()
+    if not bridges:
         html("""
             <div class="card">
             <div class="card-title">CURRENT BRIDGE</div>
@@ -853,6 +867,191 @@ def render_bridge_card(status: BridgeStatus) -> None:
         """)
         return
 
+    # Parse the shared bridge log once and distribute the findings to
+    # each running bridge by PID / test-case correlation. We use a simple
+    # heuristic: the most recent TURN marker before each bridge's
+    # "STARTING TEST EXECUTION" line belongs to its previous attempt and
+    # can be ignored; everything after is "live".
+    per_pid = _parse_bridge_log_per_process(bridges)
+
+    # Render a card per bridge
+    for b in bridges:
+        pid = b["pid"]
+        state = per_pid.get(pid) or BridgeStatus()
+        state.running = True
+        if not state.test_case:
+            # Fall back to argv from ps cmdline
+            cmd = b.get("cmd", "")
+            m = re.search(r"playwright_bridge_bot_headless\.py\s+(.*)$", cmd)
+            if m:
+                state.test_case = m.group(1).split(" ", 1)[0][:80]
+        if state.elapsed_sec <= 0:
+            state.elapsed_sec = float(parse_etime_to_seconds(b.get("etime", "")))
+        _render_single_bridge_card(state, pid=pid)
+
+    # Pool-wide kill button row
+    col_kill, col_refresh = st.columns([1, 1])
+    with col_kill:
+        confirm_key = "kill_all_confirm"
+        if st.session_state.get(confirm_key):
+            if st.button(
+                f"⚠️ Kill ALL {len(bridges)} bridges?",
+                type="primary",
+                use_container_width=True,
+                key="kill_all_go",
+            ):
+                killed = 0
+                for b in bridges:
+                    try:
+                        os.kill(int(b["pid"]), signal.SIGKILL)
+                        killed += 1
+                    except Exception:
+                        pass
+                st.success(f"SIGKILL sent to {killed}/{len(bridges)} bridges")
+                st.session_state[confirm_key] = False
+        else:
+            if st.button(
+                f"🛑 Kill all {len(bridges)} bridges",
+                use_container_width=True,
+                key="kill_all_req",
+            ):
+                st.session_state[confirm_key] = True
+                st.rerun()
+    with col_refresh:
+        if st.button("🔄 Refresh now", use_container_width=True, key="refresh_now"):
+            st.rerun()
+
+
+def _parse_bridge_log_per_process(bridges: List[Dict[str, str]]) -> Dict[str, "BridgeStatus"]:
+    """
+    Read the shared playwright_bridge_<date>.log and split the latest
+    activity into a BridgeStatus per running bridge process.
+
+    Strategy: scan the log line-by-line and maintain a "current" state.
+    Every time we encounter a `STARTING TEST EXECUTION (Attempt 1/...)` we
+    rotate into a new BridgeStatus. When we're done, return the last few
+    BridgeStatus objects — one per running bridge, in order of latest to
+    oldest — matched to process PIDs by list position (the most recently
+    spawned PID maps to the most recent StartingTestExecution, and so on).
+
+    This is a heuristic but works well in practice because:
+      * Each bridge logs its STARTING line when it boots
+      * Bridges finish in roughly the same order they started
+      * We can tie-break by elapsed seconds from `ps etime`
+
+    If the heuristic fails (log lines interleaved across PIDs), we fall
+    back to "most recent state for all bridges" which is still better
+    than nothing.
+    """
+    result: Dict[str, BridgeStatus] = {}
+    if not bridges:
+        return result
+
+    path = today_log(BRIDGE_LOG_BASENAME)
+    lines = tail_file(path, n=2000)
+    if not lines:
+        # No log yet: give every bridge an empty status so the UI still
+        # renders a card.
+        for b in bridges:
+            s = BridgeStatus()
+            s.running = True
+            result[b["pid"]] = s
+        return result
+
+    # Collect "segments" — each segment is a run of lines between two
+    # `STARTING TEST EXECUTION (Attempt 1/` markers (i.e., a new test,
+    # not a retry of the same test).
+    segments: List[BridgeStatus] = []
+    current = BridgeStatus()
+    for line in lines:
+        parsed = parse_log_line(line)
+        if not parsed:
+            continue
+        msg = parsed["msg"]
+        try:
+            ts = datetime.strptime(parsed["ts"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = None
+
+        start_match = re.search(
+            r"STARTING TEST EXECUTION\s*\(Attempt 1/(\d+)", msg
+        )
+        if start_match:
+            # New segment = new test case spawn
+            if current.started_at or current.test_case:
+                segments.append(current)
+            current = BridgeStatus()
+            current.attempt = 1
+            current.attempt_total = int(start_match.group(1))
+            current.started_at = ts
+            current.last_event_at = ts
+            continue
+
+        if ts is not None:
+            current.last_event_at = ts
+
+        m = re.search(r"TURN (\d+)/(\d+)", msg)
+        if m:
+            current.turn = int(m.group(1))
+            current.max_turns = int(m.group(2))
+
+        if msg.startswith("Content:"):
+            current.last_mila_reply = msg[len("Content:"):].strip()
+
+        m = re.search(
+            r"(?:RE)?STARTING TEST EXECUTION\s*\(Attempt (\d+)/(\d+)"
+            r"(?:, general=(\d+)/\d+, mila-reject=(\d+)/\d+)?",
+            msg,
+        )
+        if m:
+            current.attempt = int(m.group(1))
+            current.attempt_total = int(m.group(2))
+            if m.group(3):
+                current.general_restart_attempt = int(m.group(3))
+            if m.group(4):
+                current.mila_reject_attempt = int(m.group(4))
+
+        m = re.search(r"Test case:\s+(.+)$", msg)
+        if m and not current.test_case:
+            current.test_case = m.group(1).strip()
+
+    # Flush final segment
+    if current.started_at or current.test_case:
+        segments.append(current)
+
+    # Match the last N segments to the N bridges, newest-first. If we have
+    # fewer segments than bridges, pad with empty state objects.
+    tail = segments[-len(bridges):] if segments else []
+    # Bridges in ps order (usually ordered by PID / start time). Sort by
+    # elapsed time descending (longest-running first) to align with log
+    # segments (earliest started first).
+    bridges_sorted = sorted(
+        bridges,
+        key=lambda b: parse_etime_to_seconds(b.get("etime", "")),
+        reverse=True,
+    )
+
+    for i, b in enumerate(bridges_sorted):
+        if i < len(tail):
+            result[b["pid"]] = tail[-(i + 1)]  # reverse order: oldest segment to oldest bridge
+        else:
+            result[b["pid"]] = BridgeStatus()
+            result[b["pid"]].running = True
+
+    # Cross-reference with execute log for run number on the MOST RECENT one
+    run_num = _latest_run_number_from_execute_log()
+    if run_num:
+        # Best-effort: attach to the newest bridge (shortest etime)
+        newest = min(bridges, key=lambda b: parse_etime_to_seconds(b.get("etime", "")))
+        if newest["pid"] in result and not result[newest["pid"]].run_number:
+            result[newest["pid"]].run_number = run_num
+
+    return result
+
+
+def _render_single_bridge_card(status: "BridgeStatus", pid: str) -> None:
+    """Render a single bridge card (called once per parallel worker)."""
+
     pct = 0
     if status.max_turns:
         pct = min(100, int(100 * status.turn / status.max_turns))
@@ -860,7 +1059,6 @@ def render_bridge_card(status: BridgeStatus) -> None:
     test_case = _escape(status.test_case or "(unknown)")
     persona = _escape(status.persona or "")
     last_mila = _escape(status.last_mila_reply)[:400]
-    last_tester = _escape(status.last_tester_reply)[:400]
 
     attempt_line = ""
     if status.attempt and status.attempt_total:
@@ -877,7 +1075,7 @@ def render_bridge_card(status: BridgeStatus) -> None:
     last_mila_block = last_mila or '<span class="muted">(none yet)</span>'
     html(f"""
         <div class="card card-active">
-        <div class="card-title">▶ CURRENT BRIDGE</div>
+        <div class="card-title">▶ BRIDGE · PID {pid}</div>
         <div class="big-name">{test_case}</div>
         <div class="muted">{persona}</div>
         <div class="progress-outer"><div class="progress-inner" style="width: {pct}%;"></div></div>
@@ -894,24 +1092,28 @@ def render_bridge_card(status: BridgeStatus) -> None:
         </div>
     """)
 
-    # Kill button (Streamlit-native so we can react)
-    col_kill, col_refresh = st.columns([1, 1])
-    with col_kill:
-        confirm_key = "kill_confirm"
-        if st.session_state.get(confirm_key):
-            if st.button("⚠️ Really kill bridge?", type="primary", use_container_width=True, key="kill_go"):
-                ok, msg = kill_bridge()
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-                st.session_state[confirm_key] = False
-        else:
-            if st.button("🛑 Kill bridge", use_container_width=True, key="kill_req"):
-                st.session_state[confirm_key] = True
-                st.rerun()
-    with col_refresh:
-        if st.button("🔄 Refresh now", use_container_width=True, key="refresh_now"):
+    # Per-bridge kill button (keyed by PID so multiple cards don't collide)
+    confirm_key = f"kill_{pid}_confirm"
+    if st.session_state.get(confirm_key):
+        if st.button(
+            f"⚠️ Really kill PID {pid}?",
+            type="primary",
+            use_container_width=True,
+            key=f"kill_{pid}_go",
+        ):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+                st.success(f"SIGKILL sent to PID {pid}")
+            except Exception as e:
+                st.error(f"Kill failed: {e}")
+            st.session_state[confirm_key] = False
+    else:
+        if st.button(
+            f"🛑 Kill PID {pid}",
+            use_container_width=True,
+            key=f"kill_{pid}_req",
+        ):
+            st.session_state[confirm_key] = True
             st.rerun()
 
 
@@ -1155,8 +1357,7 @@ def main() -> None:
     with tab_live:
         col_a, col_b = st.columns([5, 7], gap="large")
         with col_a:
-            bridge_status = parse_bridge_status()
-            render_bridge_card(bridge_status)
+            render_bridge_cards()
         with col_b:
             st.markdown("### 🎯 Today's outcomes")
             render_outcomes_donut(records)
