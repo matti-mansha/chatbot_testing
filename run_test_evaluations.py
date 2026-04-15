@@ -7,6 +7,7 @@ Runs in a loop like prepare_test_runs.py
 import os
 import time
 import json
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Literal
 
 import httpx
@@ -301,9 +302,111 @@ def find_prop_key_ci(props: Dict[str, Any], desired_name: str) -> Optional[str]:
 # QUERY EXECUTIONS TO EVALUATE
 # =====================================
 
+STALE_EVAL_CLAIM_MINUTES = int(os.getenv("STALE_EVAL_CLAIM_MINUTES", "5"))
+
+
+def reap_stale_evaluation_claims(db_id: str) -> int:
+    """
+    Recovery for evaluations that were left in "Evaluation started" status
+    when the evaluator was killed mid-call (e.g. service restart or crash
+    between the "mark as Evaluation started" PATCH and the follow-up
+    OpenAI call → evaluation-page creation → "Evaluation completed" PATCH).
+
+    Without this, such rows sit in a dead state forever — the main query
+    only looks at "Test Executed" status, so nothing picks them up again.
+
+    Strategy: every polling iteration, also query for executions whose
+    status is "Evaluation started" AND whose last_edited_time is older
+    than STALE_EVAL_CLAIM_MINUTES. For each match, PATCH the status back
+    to "Test Executed" so the normal evaluator loop re-tries it on the
+    next poll. We use last_edited_time instead of a stored claim
+    timestamp because Notion updates that field automatically on every
+    PATCH, and the "Evaluation started" PATCH is the last thing we did
+    to these rows, so their last_edited_time is effectively the claim
+    timestamp.
+
+    Returns the number of rows reset.
+    """
+    cutoff = datetime.utcnow() - timedelta(minutes=STALE_EVAL_CLAIM_MINUTES)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    body: Dict[str, Any] = {
+        "filter": {
+            "and": [
+                {
+                    "property": "Test Execution Status",
+                    "status": {"equals": "Evaluation started"},
+                },
+                {
+                    "timestamp": "last_edited_time",
+                    "last_edited_time": {"before": cutoff_iso},
+                },
+            ]
+        }
+    }
+    try:
+        resp = httpx.post(
+            f"{NOTION_API_BASE}/databases/{db_id}/query",
+            headers=HEADERS,
+            json=body,
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"⚠️ reap_stale_evaluation_claims query failed: {e}")
+        return 0
+
+    stale = resp.json().get("results", [])
+    if not stale:
+        return 0
+
+    logger.warning(
+        f"🧟 Found {len(stale)} stale 'Evaluation started' claim(s) "
+        f"older than {STALE_EVAL_CLAIM_MINUTES} min — resetting to 'Test Executed'"
+    )
+    print(
+        f"🧟 Reaping {len(stale)} stale evaluation claim(s) "
+        f"(older than {STALE_EVAL_CLAIM_MINUTES} min)"
+    )
+    reset_count = 0
+    for row in stale:
+        row_id = row.get("id", "")
+        if not row_id:
+            continue
+        try:
+            httpx.patch(
+                f"{NOTION_API_BASE}/pages/{row_id}",
+                headers=HEADERS,
+                json={
+                    "properties": {
+                        "Test Execution Status": {
+                            "status": {"name": "Test Executed"}
+                        }
+                    }
+                },
+                timeout=30.0,
+            ).raise_for_status()
+            logger.info(f"   ✓ Reset stale claim: {row_id}")
+            reset_count += 1
+        except Exception as e:
+            logger.error(f"   ✗ Failed to reset {row_id}: {e}")
+    return reset_count
+
+
 def get_executions_to_evaluate(db_id: str) -> List[Dict[str, Any]]:
-    """Query for executions with status 'Test Executed'"""
+    """Query for executions with status 'Test Executed'.
+
+    Before the main query, also run reap_stale_evaluation_claims() to
+    unstick any orphaned 'Evaluation started' rows left behind by a
+    mid-evaluation crash / service restart."""
     logger.info("Querying for executions to evaluate")
+
+    # Recovery pass: unstick orphaned claims from previous runs
+    try:
+        reap_stale_evaluation_claims(db_id)
+    except Exception as e:
+        logger.warning(f"⚠️ stale-claim reaper raised: {e} (continuing)")
+
     results: List[Dict[str, Any]] = []
     cursor = None
 
