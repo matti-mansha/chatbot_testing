@@ -16,8 +16,9 @@ import os
 import time
 import pathlib
 import sys
+import json
 import httpx
-from typing import Optional, List, Dict, Tuple
+from typing import Any, Optional, List, Dict, Tuple
 from diagnostic_utils import DiagnosticCapture
 from playwright.sync_api import (
     sync_playwright,
@@ -111,6 +112,9 @@ logger.info("=" * 80)
 
 # Conversation log
 CONVERSATION_LOG: List[Dict[str, str]] = []
+
+# Per-turn completeness scores for KPI tracking
+PER_TURN_SCORES: List[Dict[str, Any]] = []
 
 # Session ID for the test bot API
 tester_session_id: Optional[str] = None
@@ -1251,8 +1255,9 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
     Raises RestartTestRequired if technical error detected.
     Returns: (conversation_log, number_of_turns)
     """
-    global CONVERSATION_LOG
+    global CONVERSATION_LOG, PER_TURN_SCORES
     CONVERSATION_LOG = []
+    PER_TURN_SCORES = []
     
     turns_completed = 0
 
@@ -1420,7 +1425,14 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                     break
                 
                 tester_reply, score, should_continue = result
-                
+
+                # Track per-turn completeness score for KPI calculation
+                PER_TURN_SCORES.append({
+                    "turn": turn,
+                    "score": score,
+                    "should_continue": should_continue,
+                })
+
                 # Format reply
                 if score is not None:
                     if score >= 80:
@@ -1661,10 +1673,16 @@ if __name__ == "__main__":
             logger.info("✅ SCRIPT COMPLETED SUCCESSFULLY")
             logger.info(f"  Conversation entries: {len(conversation_log)}")
             logger.info(f"  Number of turns: {num_turns}")
+            logger.info(f"  Per-turn scores: {PER_TURN_SCORES}")
             logger.info("=" * 80)
             print(f"\n📊 Summary:")
             print(f"   Conversation entries: {len(conversation_log)}")
             print(f"   Number of turns: {num_turns}")
+
+            # Output per-turn scores as parseable line for run_test_executions.py
+            score_values = [s.get("score") for s in PER_TURN_SCORES if s.get("score") is not None]
+            if score_values:
+                print(f"   Per-turn scores: {json.dumps(score_values)}")
         else:
             logger.error("=" * 80)
             logger.error("❌ SCRIPT FAILED")

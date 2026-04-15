@@ -335,15 +335,33 @@ def extract_turn_count_from_output(output: str) -> Optional[int]:
     return None
 
 
+def extract_per_turn_scores_from_output(output: str) -> Optional[List[int]]:
+    """Extract per-turn completeness scores from bridge script output."""
+    import re
+    import json as _json
+
+    match = re.search(r"Per-turn scores:\s*(\[[\d,\s]+\])", output)
+    if match:
+        try:
+            scores = _json.loads(match.group(1))
+            logger.debug(f"  Extracted per-turn scores: {scores}")
+            return scores
+        except Exception:
+            pass
+
+    logger.debug("  No per-turn scores found in output")
+    return None
+
+
 def run_playwright_bridge(
     test_case_name: str = "",
     persona: str = "",
     test_case_details: str = "",
     test_case_prompt: str = "",
-) -> Tuple[str, Optional[int]]:
+) -> Tuple[str, Optional[int], Optional[List[int]]]:
     """
     Run playwright_bridge_bot.py as a subprocess and capture stdout as conversation transcript.
-    Returns: (conversation_text, number_of_turns)
+    Returns: (conversation_text, number_of_turns, per_turn_scores)
     """
     logger.info(f"Running Playwright bridge script: {BRIDGE_SCRIPT}")
     logger.debug(f"  Test case: {test_case_name}")
@@ -407,14 +425,19 @@ def run_playwright_bridge(
         else:
             logger.warning("⚠️ Could not extract turn count from output")
             print("   ⚠️ Could not extract turn count from output")
-        
-        return conversation_text, number_of_turns
-        
+
+        per_turn_scores = extract_per_turn_scores_from_output(conversation_text)
+        if per_turn_scores is not None:
+            logger.info(f"✓ Extracted per-turn scores: {per_turn_scores}")
+            print(f"   ✓ Per-turn scores: {per_turn_scores}")
+
+        return conversation_text, number_of_turns, per_turn_scores
+
     except Exception as e:
         log_exception(logger, e, "run_playwright_bridge")
         logger.error(f"   ❌ Error running bridge script: {e}")
         print(f"   ❌ Error running bridge script: {e}")
-        return f"(Bridge error: {e})", None
+        return f"(Bridge error: {e})", None, None
 
 
 # =====================================
@@ -480,7 +503,7 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
 
     # Run the bridge
     start_ts = time.monotonic()
-    conversation_text, number_of_turns = run_playwright_bridge(
+    conversation_text, number_of_turns, per_turn_scores = run_playwright_bridge(
         test_case_name=test_case_name,
         persona=persona,
         test_case_details=test_case_details,
@@ -490,15 +513,24 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
 
     logger.info(f"   ⏱ Execution duration: {duration:.1f} seconds")
     print(f"   ⏱ Execution duration: {duration:.1f} seconds")
-    
+
     if number_of_turns is not None:
         logger.info(f"   🔄 Number of turns: {number_of_turns}")
         print(f"   🔄 Number of turns: {number_of_turns}")
 
+    if per_turn_scores:
+        logger.info(f"   📈 Per-turn scores: {per_turn_scores}")
+        print(f"   📈 Per-turn scores: {per_turn_scores}")
+
+    # Append per-turn scores metadata to conversation text for KPI retrieval
+    if per_turn_scores:
+        import json as _json
+        conversation_text += f"\n\n--- Per-turn completeness scores ---\n{_json.dumps(per_turn_scores)}"
+
     # Create conversation page
     conv_title = f"Conversation – {run_number or ''} – {test_case_name or page_id}"
     logger.info(f"Creating conversation page: {conv_title}")
-    
+
     conv_page_id = create_formatted_conversation_page(
         parent_page_id=CONVERSATIONS_PARENT_PAGE_ID,
         title=conv_title,
