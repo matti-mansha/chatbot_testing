@@ -45,6 +45,34 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import textwrap
+
+
+def html(raw: str) -> None:
+    """
+    Render HTML via st.markdown(unsafe_allow_html=True) without the
+    CommonMark "indented code block" trap.
+
+    Streamlit's markdown pipeline is CommonMark, which treats any line
+    that is whitespace-only as a blank line. Inside an HTML block of
+    type 6 (starts with <div>, etc.), a blank line ENDS the HTML block.
+    Anything that follows with 4+ leading spaces is then rendered as an
+    indented code block — which is why <code>&lt;/div&gt;</code> literal
+    strings were leaking into the hero.
+
+    This helper:
+        1. textwrap.dedent()s the string (kills common leading whitespace)
+        2. Strips every purely whitespace line (so empty f-string
+           substitutions can't open a code block)
+        3. Left-justifies (strips leading whitespace on each remaining
+           line) so no line has 4+ leading spaces — belt-and-braces
+
+    The result is a sequence of content-only lines that CommonMark
+    treats as a single continuous HTML block.
+    """
+    dedented = textwrap.dedent(raw)
+    lines = [ln.lstrip() for ln in dedented.splitlines() if ln.strip()]
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
 
 # streamlit-autorefresh is the clean way to do partial-rerun-based auto-refresh
 # (no page reload, no flicker, preserves scroll). Fall back to a full page
@@ -701,19 +729,13 @@ def render_hero(svc_state: Dict[str, Dict[str, Any]]) -> None:
     refresh_label = (
         f"Auto-refresh · tick {now_local}" if HAS_AUTOREFRESH else f"Full reload · tick {now_local}"
     )
-    st.markdown(
-        f"""
-<div class="hero">
-    <div class="hero-title">🧪 MILA TEST CONTROL</div>
-    <div class="hero-sub">{refresh_label} · {now_utc}</div>
-    <div class="status-row">
-        {''.join(pills_html)}
-        {bridge_pill}
-    </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    html(f"""
+        <div class="hero">
+        <div class="hero-title">🧪 MILA TEST CONTROL</div>
+        <div class="hero-sub">{refresh_label} · {now_utc}</div>
+        <div class="status-row">{''.join(pills_html)}{bridge_pill}</div>
+        </div>
+    """)
 
 
 def render_metric_strip(svc_state: Dict[str, Dict[str, Any]]) -> None:
@@ -737,33 +759,30 @@ def render_metric_strip(svc_state: Dict[str, Dict[str, Any]]) -> None:
     log_size = human_bytes(log_dir_size_bytes())
     diag_size = human_bytes(diag_dir_size_bytes())
 
-    st.markdown(
-        f"""
-<div class="metric-strip">
-    <div class="metric-cell">
+    html(f"""
+        <div class="metric-strip">
+        <div class="metric-cell">
         <div class="metric-label">Passed today</div>
         <div class="metric-value" style="color:#4ade80;">{today_passed}</div>
         <div class="metric-sub">of {today_total} finished</div>
-    </div>
-    <div class="metric-cell">
+        </div>
+        <div class="metric-cell">
         <div class="metric-label">Failed today</div>
         <div class="metric-value" style="color:#f87171;">{today_failed}</div>
         <div class="metric-sub">pass rate {pass_rate}</div>
-    </div>
-    <div class="metric-cell">
+        </div>
+        <div class="metric-cell">
         <div class="metric-label">Pending</div>
         <div class="metric-value">{pending_str}</div>
         <div class="metric-sub">avg run {avg_dur}</div>
-    </div>
-    <div class="metric-cell">
+        </div>
+        <div class="metric-cell">
         <div class="metric-label">Disk</div>
         <div class="metric-value" style="font-size:20px;">{log_size}</div>
         <div class="metric-sub">diagnostics {diag_size}</div>
-    </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+        </div>
+        </div>
+    """)
 
 
 def _escape(text: str) -> str:
@@ -772,17 +791,14 @@ def _escape(text: str) -> str:
 
 def render_bridge_card(status: BridgeStatus) -> None:
     if not status.running:
-        st.markdown(
-            """
-<div class="card">
-    <div class="card-title">CURRENT BRIDGE</div>
-    <div class="big-name">💤 Pipeline idle</div>
-    <div class="muted">No Playwright bridge subprocess is running right now.
-    The next run will fire when prepare/execute sees a pending execution.</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+        html("""
+            <div class="card">
+            <div class="card-title">CURRENT BRIDGE</div>
+            <div class="big-name">💤 Pipeline idle</div>
+            <div class="muted">No Playwright bridge subprocess is running right now.
+            The next run will fire when prepare/execute sees a pending execution.</div>
+            </div>
+        """)
         return
 
     pct = 0
@@ -806,37 +822,25 @@ def render_bridge_card(status: BridgeStatus) -> None:
             f'<span class="kv-v">{status.attempt}/{status.attempt_total}{rej_bit}</span></div>'
         )
 
-    st.markdown(
-        f"""
-<div class="card card-active">
-    <div class="card-title">▶ CURRENT BRIDGE</div>
-    <div class="big-name">{test_case}</div>
-    <div class="muted">{persona}</div>
-
-    <div class="progress-outer">
-        <div class="progress-inner" style="width: {pct}%;"></div>
-    </div>
-    <div style="display:flex; justify-content:space-between; font-size:12px; color:#9ca3af;">
-        <span>Turn {status.turn}/{status.max_turns}</span>
-        <span>{pct}%</span>
-    </div>
-
-    <div style="margin-top:12px;">
+    last_mila_block = last_mila or '<span class="muted">(none yet)</span>'
+    html(f"""
+        <div class="card card-active">
+        <div class="card-title">▶ CURRENT BRIDGE</div>
+        <div class="big-name">{test_case}</div>
+        <div class="muted">{persona}</div>
+        <div class="progress-outer"><div class="progress-inner" style="width: {pct}%;"></div></div>
+        <div style="display:flex; justify-content:space-between; font-size:12px; color:#9ca3af;"><span>Turn {status.turn}/{status.max_turns}</span><span>{pct}%</span></div>
+        <div style="margin-top:12px;">
         {attempt_line}
         <div class="kv"><span class="kv-k">Elapsed</span><span class="kv-v">{elapsed}</span></div>
         <div class="kv"><span class="kv-k">Run number</span><span class="kv-v">{_escape(status.run_number) or '—'}</span></div>
-    </div>
-
-    <div style="margin-top:12px;">
-        <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">LAST MILA REPLY</div>
-        <div style="margin-top:4px; font-size:12.5px; color:#d1d5db; max-height:100px; overflow-y:auto;">
-            {last_mila or '<span class="muted">(none yet)</span>'}
         </div>
-    </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+        <div style="margin-top:12px;">
+        <div style="font-size:11px; color:#9ca3af; text-transform:uppercase; letter-spacing:1px;">LAST MILA REPLY</div>
+        <div style="margin-top:4px; font-size:12.5px; color:#d1d5db; max-height:100px; overflow-y:auto;">{last_mila_block}</div>
+        </div>
+        </div>
+    """)
 
     # Kill button (Streamlit-native so we can react)
     col_kill, col_refresh = st.columns([1, 1])
@@ -988,7 +992,8 @@ def render_log_tail() -> None:
             cls = "log-info"
         return f'<span class="{cls}">{_escape(line)}</span>'
 
-    body = "\n".join(_color(l) for l in lines)
+    body = "<br>".join(_color(l) for l in lines)
+    # Single-line HTML — no markdown indent trap possible.
     st.markdown(f'<div class="log-box">{body}</div>', unsafe_allow_html=True)
 
 
