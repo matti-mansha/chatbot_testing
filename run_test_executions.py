@@ -249,6 +249,17 @@ def get_pending_executions(db_id: str) -> List[Dict[str, Any]]:
     Query Test Case Executions DB for rows where:
       - Test Case Status = Active
       - Test Execution Status = Not started
+
+    Results are sorted by created_time DESCENDING so the newest test run's
+    executions are processed first. This is crucial when multiple test runs
+    have been queued: without this sort, Notion returns results in
+    insertion order (oldest first), which causes a newly-triggered test run
+    to sit behind stale executions from earlier runs (possibly days old
+    and no longer relevant). With newest-first, triggering a new test run
+    immediately jumps its executions to the front of the queue.
+
+    Sort order within a single run is reverse creation order, which is
+    functionally fine — tests don't have inter-execution dependencies.
     """
     logger.info(f"Querying for pending executions in database: {db_id}")
     executions: List[Dict[str, Any]] = []
@@ -268,7 +279,13 @@ def get_pending_executions(db_id: str) -> List[Dict[str, Any]]:
                         "status": {"equals": "Not started"},
                     },
                 ]
-            }
+            },
+            "sorts": [
+                {
+                    "timestamp": "created_time",
+                    "direction": "descending",
+                }
+            ],
         }
         if cursor:
             body["start_cursor"] = cursor
