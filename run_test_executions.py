@@ -52,12 +52,27 @@ CHECK_INTERVAL = int(os.getenv("EXECUTION_CHECK_INTERVAL", "10"))  # seconds
 EXECUTION_SUCCESS_STATUS = os.getenv("EXECUTION_SUCCESS_STATUS", "Test Executed")
 EXECUTION_FAILED_STATUS = os.getenv("EXECUTION_FAILED_STATUS", "Test Execustion Started")
 
-# How many bridge subprocesses can run concurrently. Each bridge spawns its
-# own headless chromium + its own tester-bot session, so they are mutually
-# independent from the bot side. The shared bottleneck is Mila's backend
-# (xi-deepchat API) — keep this modest (3-5) to avoid tripping rate limits
-# or session conflicts on a single Mila account.
-EXECUTION_PARALLELISM = int(os.getenv("EXECUTION_PARALLELISM", "3"))
+# How many bridge subprocesses can run concurrently.
+#
+# Default is 1 (serial). Per-bridge client state is fully isolated
+# (separate Playwright browser context, separate cookie jar, separate
+# login → separate Drupal session cookie, separate per-context
+# sessionStorage for the widget's client-side chat history), so the
+# browser side is parallel-safe.
+#
+# The reason for the conservative default is the SERVER side. Mila's
+# xi-deepchat API request body contains no conversation_id or thread_id
+# — only assistant_id and the hardcoded contexts.current_route — so
+# conversation state on the backend must be keyed by something derived
+# from the request (session cookie or Drupal user_id). Without being
+# able to read the Drupal module source, we can't prove the backend
+# isn't keyed on user_id, in which case parallel workers using the same
+# MILA account would all share/corrupt each other's conversation thread.
+#
+# To safely use EXECUTION_PARALLELISM > 1, use a pool of distinct MILA
+# accounts (one per worker). Until account pooling is implemented here,
+# set this to 1. You can still override via env var for experiments.
+EXECUTION_PARALLELISM = int(os.getenv("EXECUTION_PARALLELISM", "1"))
 
 # Notion API
 NOTION_API_BASE = "https://api.notion.com/v1"
@@ -682,9 +697,26 @@ def run_execution_loop(check_interval: int = 10):
     spawning when Mila is slow.
     """
     logger.info("=" * 80)
-    logger.info(f"🚀 Test Execution Service Started (Parallel Mode, workers={EXECUTION_PARALLELISM})")
-    logger.info("=" * 80)
-    print(f"🚀 Test Execution Service Started (Parallel Mode, workers={EXECUTION_PARALLELISM})")
+    if EXECUTION_PARALLELISM == 1:
+        logger.info("🚀 Test Execution Service Started (Serial Mode, workers=1)")
+        print("🚀 Test Execution Service Started (Serial Mode, workers=1)")
+    else:
+        logger.info(
+            f"🚀 Test Execution Service Started (Parallel Mode, workers={EXECUTION_PARALLELISM})"
+        )
+        logger.warning(
+            f"⚠️  PARALLELISM > 1 with a single MILA account is RISKY. Mila's "
+            f"xi-deepchat backend may key conversation state by user_id, which "
+            f"would cause cross-contamination between concurrent workers. Only "
+            f"use this if you have confirmed MILA isolates per session."
+        )
+        print(
+            f"🚀 Test Execution Service Started (Parallel Mode, workers={EXECUTION_PARALLELISM})"
+        )
+        print(
+            f"⚠️  WARNING: parallelism > 1 with a single MILA account is risky — "
+            f"MILA may mix conversation state across parallel workers."
+        )
 
     if not verify_env():
         return
