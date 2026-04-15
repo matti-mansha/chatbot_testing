@@ -199,11 +199,17 @@ SELECTORS = {
             "button[aria-label='Send'], "
             "button:has-text('Send')"
         ),
-        # Chat widget structure selectors
+        # Chat widget structure selectors.
+        # The FAB used to be <div class="fab-mode"> but in the current MILA UI
+        # it is <button class="fab-mode">. The double selector keeps the fix
+        # forward- and backward-compatible. Authoritative open/collapsed state
+        # is read from the .chat-container class list (chat-open vs
+        # chat-collapsed) by is_mila_chat_open(), not from FAB visibility.
+        "chat_container": "div.chat-container",
         "chat_header": "div.chat-header",
-        "fab_button": "div.fab-mode",
+        "fab_button": "button.fab-mode, div.fab-mode",
         "header_mode": "div.header-mode",
-        "close_button": "span.js-chat-toggle, span.toggle-icon",
+        "close_button": "button.toggle-icon, span.js-chat-toggle, span.toggle-icon",
         # Legacy header selector (kept for backward compatibility)
         "header": "div.chat-header",
         # Reset/clear chat
@@ -860,63 +866,131 @@ def perform_mila_login(page: Page):
         print(f"❌ Error during login: {e}")
 
 
+def get_mila_chat_container_classes(page: Page) -> str:
+    """
+    Return the full className string of the Mila chat container, or "" if
+    the container is not in the DOM yet.
+
+    The container's class list is the authoritative source of chat state:
+        .chat-container.chat-open       → widget expanded, input visible
+        .chat-container.chat-collapsed  → widget minimized, input hidden
+
+    All previous indirect checks (header-mode visibility, FAB visibility,
+    aria-expanded attributes) can lie during transitional states, so we
+    always consult this instead.
+    """
+    try:
+        return page.evaluate(
+            "() => { const c = document.querySelector('div.chat-container'); "
+            "return c ? c.className : ''; }"
+        ) or ""
+    except Exception as e:
+        logger.debug(f"  get_mila_chat_container_classes failed: {e}")
+        return ""
+
+
+def is_mila_chat_open(page: Page) -> bool:
+    """Return True iff the Mila chat container is currently in the open state."""
+    classes = get_mila_chat_container_classes(page)
+    # "chat-open" is an explicit positive signal. If neither class is present
+    # we can't say for sure, so err on the side of "not open" and let the
+    # caller click the FAB.
+    return "chat-open" in classes and "chat-collapsed" not in classes
+
+
+def wait_for_mila_chat_state(page: Page, want_open: bool, timeout_ms: int = 5000) -> bool:
+    """
+    Wait for the chat container to reach the requested state. Returns True
+    on success, False on timeout. Does not raise.
+    """
+    want_class = "chat-open" if want_open else "chat-collapsed"
+    try:
+        page.wait_for_function(
+            f"""() => {{
+                const c = document.querySelector('div.chat-container');
+                return c && c.classList.contains('{want_class}');
+            }}""",
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception as e:
+        logger.debug(f"  wait_for_mila_chat_state({want_open}) timed out: {e}")
+        return False
+
+
 def open_mila_chat(page: Page):
-    """Open Mila chat widget by clicking the FAB button if chat is collapsed"""
+    """
+    Open the Mila chat widget if it is not already open.
+
+    State is read from the .chat-container class list (chat-open vs
+    chat-collapsed), not from FAB / header visibility, because those elements
+    remain in the DOM in both states and their individual CSS visibility can
+    lag behind the transition.
+    """
     logger.info("=" * 60)
     logger.info("OPENING MILA CHAT WIDGET")
     logger.info("=" * 60)
 
     try:
-        # Check if the chat is already in expanded (header-mode) state
-        header_mode = page.locator(SELECTORS["mila"]["header_mode"]).first
+        # Wait briefly for the container to appear (page just loaded)
         try:
-            if header_mode.is_visible(timeout=3000):
-                logger.info("💬 Chat widget already open (header-mode visible)")
-                print("💬 Mila chat widget already open.")
-                logger.info("=" * 60)
-                take_screenshot(page, "chat_already_open")
-                return
+            page.locator(SELECTORS["mila"]["chat_container"]).first.wait_for(
+                state="attached", timeout=5000
+            )
         except Exception:
-            pass
+            logger.warning("⚠️ Chat container not yet attached — proceeding anyway")
 
-        # Chat is collapsed - look for the FAB button to open it
-        logger.debug(f"Looking for FAB button: {SELECTORS['mila']['fab_button']}")
+        if is_mila_chat_open(page):
+            logger.info("💬 Chat widget already open (chat-container.chat-open)")
+            print("💬 Mila chat widget already open.")
+            logger.info("=" * 60)
+            take_screenshot(page, "chat_already_open")
+            return
+
+        classes = get_mila_chat_container_classes(page)
+        logger.info(f"💬 Chat container state: '{classes}' — needs opening")
+        print("💬 Opening Mila chat widget...")
+
+        # Click the FAB button. Current MILA UI uses <button class="fab-mode">;
+        # the selector also matches the older <div class="fab-mode"> for
+        # backward compatibility.
         fab = page.locator(SELECTORS["mila"]["fab_button"]).first
-
         try:
             fab.wait_for(state="visible", timeout=10000)
-            logger.info("💬 Chat widget collapsed, clicking FAB to open...")
-            print("💬 Opening Mila chat widget via FAB button...")
-            fab.click()
-            page.wait_for_timeout(1000)
-
-            # Verify it opened
-            try:
-                header_mode.wait_for(state="visible", timeout=5000)
-                logger.info("✓ Chat widget opened successfully")
-            except Exception:
-                logger.warning("⚠️ FAB clicked but header-mode not visible yet, continuing anyway")
-
-            logger.info("=" * 60)
-            take_screenshot(page, "chat_opened")
-            return
-        except Exception as e:
-            logger.debug(f"FAB button not found or not visible: {e}")
-
-        # Fallback: try legacy header selector with aria-expanded
-        logger.debug("Trying legacy header approach...")
-        header = page.locator("div.ai-deepchat--header").first
-        try:
-            header.wait_for(state="visible", timeout=3000)
-            aria_expanded = header.get_attribute("aria-expanded")
-            if aria_expanded == "false":
-                header.click()
-                page.wait_for_timeout(800)
-                logger.info("✓ Chat widget opened via legacy header")
-            else:
-                logger.info("💬 Chat widget already open (legacy)")
         except Exception:
-            logger.debug("Legacy header not found either")
+            # FAB not visible? Use JavaScript to click it anyway — it's
+            # attached to the DOM either way, and in some transitional states
+            # Playwright's visibility check is too strict.
+            logger.warning("⚠️ FAB button not 'visible' to Playwright — using JS click fallback")
+            clicked = page.evaluate(
+                """() => {
+                    const b = document.querySelector('button.fab-mode, div.fab-mode');
+                    if (b) { b.click(); return true; }
+                    return false;
+                }"""
+            )
+            if not clicked:
+                logger.error("❌ FAB button not found in DOM — cannot open chat")
+                raise RuntimeError("Mila FAB button not found in DOM")
+        else:
+            fab.click()
+
+        page.wait_for_timeout(300)
+
+        if wait_for_mila_chat_state(page, want_open=True, timeout_ms=5000):
+            logger.info("✓ Chat widget opened successfully (chat-container.chat-open)")
+            print("✓ Mila chat widget opened")
+        else:
+            new_classes = get_mila_chat_container_classes(page)
+            logger.error(
+                f"❌ FAB clicked but chat-container did not reach chat-open state "
+                f"(current classes: '{new_classes}')"
+            )
+            print(f"❌ Could not confirm Mila chat opened. Classes: {new_classes}")
+            raise RuntimeError(
+                f"Mila chat did not transition to chat-open after FAB click "
+                f"(classes: {new_classes})"
+            )
 
         logger.info("=" * 60)
         take_screenshot(page, "chat_opened")
@@ -925,6 +999,10 @@ def open_mila_chat(page: Page):
         log_exception(logger, e, "open_mila_chat")
         logger.warning("=" * 60)
         print(f"ℹ️ Could not open Mila chat widget automatically: {e}")
+        # Do NOT silently continue — let subsequent operations fail loudly
+        # so RestartTestRequired kicks in and this gets retried in a fresh
+        # browser context instead of the old broken state.
+        raise
 
 
 def clear_mila_history(page: Page):
@@ -1068,34 +1146,63 @@ def clear_mila_history(page: Page):
 
 
 def ensure_mila_chat_open(page: Page):
-    """Ensure Mila chat is open - click FAB button if collapsed"""
+    """
+    Ensure Mila chat is in the open state. Uses the authoritative
+    .chat-container class list (chat-open / chat-collapsed) rather than
+    FAB visibility, which lies during transitional states.
+
+    Raises RuntimeError if the chat cannot be opened after a FAB click +
+    JS-click fallback. The caller's except-Exception handler will convert
+    that into a RestartTestRequired so the whole test restarts in a fresh
+    browser context (which is the only reliable recovery for the MILA
+    widget's known zombie state).
+    """
     logger.debug("Ensuring Mila chat is open")
 
     try:
-        # Check if chat is collapsed (FAB mode visible)
-        fab = page.locator(SELECTORS["mila"]["fab_button"]).first
-        try:
-            if fab.is_visible(timeout=2000):
-                logger.info("💬 Chat collapsed, reopening via FAB button")
-                print("💬 Reopening Mila chat widget...")
-                fab.click()
-                page.wait_for_timeout(1000)
-        except Exception:
-            pass
+        if is_mila_chat_open(page):
+            logger.debug("  Chat already open (chat-container.chat-open)")
+        else:
+            classes_before = get_mila_chat_container_classes(page)
+            logger.info(
+                f"💬 Chat not open — container classes: '{classes_before}' — reopening"
+            )
+            print("💬 Reopening Mila chat widget...")
 
-        # Legacy fallback: check header with aria-expanded
-        try:
-            header = page.locator("div.ai-deepchat--header").first
-            if header.is_visible(timeout=1000):
-                aria_expanded = header.get_attribute("aria-expanded")
-                if aria_expanded == "false":
-                    logger.info("💬 Reopening chat widget (legacy)")
-                    header.click()
-                    page.wait_for_timeout(800)
-        except Exception:
-            pass
+            # Try a normal Playwright click first; fall back to a raw JS
+            # click if Playwright refuses (transitional visibility issues).
+            fab = page.locator(SELECTORS["mila"]["fab_button"]).first
+            clicked = False
+            try:
+                fab.click(timeout=3000)
+                clicked = True
+            except Exception as click_err:
+                logger.warning(
+                    f"  FAB Playwright click failed ({click_err}) — trying JS fallback"
+                )
+                clicked = page.evaluate(
+                    """() => {
+                        const b = document.querySelector('button.fab-mode, div.fab-mode');
+                        if (b) { b.click(); return true; }
+                        return false;
+                    }"""
+                )
 
-        # Scroll chat to bottom - try shadow DOM message container first
+            if not clicked:
+                raise RuntimeError("FAB button not found in DOM during ensure_mila_chat_open")
+
+            # Wait for the container class to flip to chat-open — this is
+            # the only reliable "we really opened" signal.
+            if not wait_for_mila_chat_state(page, want_open=True, timeout_ms=5000):
+                classes_after = get_mila_chat_container_classes(page)
+                raise RuntimeError(
+                    f"FAB clicked but chat-container did not reach chat-open state "
+                    f"(classes: '{classes_after}')"
+                )
+            logger.info("  ✓ Chat reopened successfully")
+
+        # Scroll chat to bottom so new messages are visible. This must run
+        # regardless of how we got here.
         page.evaluate("""
             // Try deep-chat shadow DOM first
             const deepChat = document.querySelector('deep-chat');
@@ -1111,10 +1218,16 @@ def ensure_mila_chat_open(page: Page):
                 chatContainer.scrollTop = chatContainer.scrollHeight;
             }
         """)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
         logger.debug("  Chat scrolled to bottom")
+
     except Exception as e:
-        logger.warning(f"Could not ensure chat is open: {e}")
+        # Loud failure — propagate to send_message_to_mila, which will retry
+        # up to its own max_retries, then raise, which our new
+        # PlaywrightTimeoutError / generic-exception handlers in the main
+        # turn loop convert into RestartTestRequired.
+        logger.error(f"❌ ensure_mila_chat_open failed: {e}")
+        raise
 
 
 def find_mila_input(page: Page) -> Optional[any]:
