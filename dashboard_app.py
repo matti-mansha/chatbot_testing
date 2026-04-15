@@ -446,24 +446,65 @@ class BridgeStatus:
     general_restart_attempt: int = 0
 
 
+_ETIME_RE = re.compile(
+    r"(?:(?P<d>\d+)-)?(?:(?P<h>\d+):)?(?P<m>\d+):(?P<s>\d+)"
+)
+
+
+def parse_etime_to_seconds(etime: str) -> int:
+    """Convert `ps -o etime` output (e.g. 01:37, 02:15:04, 1-12:34:56) to seconds."""
+    if not etime:
+        return 0
+    m = _ETIME_RE.match(etime.strip())
+    if not m:
+        return 0
+    d = int(m.group("d") or 0)
+    h = int(m.group("h") or 0)
+    mm = int(m.group("m") or 0)
+    s = int(m.group("s") or 0)
+    return d * 86400 + h * 3600 + mm * 60 + s
+
+
+def _latest_run_number_from_execute_log(max_lines: int = 400) -> str:
+    """Grab the most recent "Test run number: TR1.TCXX.N" from test_execution log."""
+    path = today_log("test_execution")
+    lines = tail_file(path, n=max_lines)
+    for line in reversed(lines):
+        parsed = parse_log_line(line)
+        if not parsed:
+            continue
+        m = re.search(r"Test run number:\s+(\S+)", parsed["msg"])
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _latest_persona_from_execute_log(max_lines: int = 400) -> str:
+    path = today_log("test_execution")
+    lines = tail_file(path, n=max_lines)
+    for line in reversed(lines):
+        parsed = parse_log_line(line)
+        if not parsed:
+            continue
+        m = re.search(r"Persona:\s+(.+)$", parsed["msg"])
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def parse_bridge_status(max_lines: int = 600) -> BridgeStatus:
     """Scrape the latest bridge activity from playwright_bridge_<date>.log."""
     path = today_log(BRIDGE_LOG_BASENAME)
     status = BridgeStatus()
     lines = tail_file(path, n=max_lines)
-    if not lines:
-        return status
 
-    # Scan in reverse to find the latest meaningful markers
-    latest_ts = None
     last_turn_set = False
     last_mila_set = False
-    last_tester_set = False
     started_at_set = False
     attempt_set = False
     test_case_set = False
 
-    for line in reversed(lines):
+    for line in reversed(lines or []):
         parsed = parse_log_line(line)
         if not parsed:
             continue
@@ -472,8 +513,7 @@ def parse_bridge_status(max_lines: int = 600) -> BridgeStatus:
             ts = datetime.strptime(parsed["ts"], "%Y-%m-%d %H:%M:%S")
         except Exception:
             ts = None
-        if latest_ts is None and ts is not None:
-            latest_ts = ts
+        if status.last_event_at is None and ts is not None:
             status.last_event_at = ts
 
         if not last_turn_set:
@@ -483,13 +523,21 @@ def parse_bridge_status(max_lines: int = 600) -> BridgeStatus:
                 status.max_turns = int(m.group(2))
                 last_turn_set = True
 
-        if not last_mila_set and msg.startswith("  Content: "):
-            status.last_mila_reply = msg[len("  Content: "):].strip()
+        # Mila reply preview — the log format after the final `|` has its
+        # leading whitespace stripped by the pipe-separator regex, so the
+        # message starts with "Content: …" (no leading spaces).
+        if not last_mila_set and msg.startswith("Content:"):
+            status.last_mila_reply = msg[len("Content:"):].strip()
             last_mila_set = True
 
+        # Match STARTING or RESTARTING TEST EXECUTION specifically — NOT
+        # the bare "Attempt N/M" which also appears in the tester-API send
+        # retry counter and would cause us to show "1/3" instead of the
+        # real restart-attempt counter.
         if not attempt_set:
             m = re.search(
-                r"Attempt (\d+)/(\d+)(?:, general=(\d+)/\d+, mila-reject=(\d+)/\d+)?",
+                r"(?:RE)?STARTING TEST EXECUTION\s*\(Attempt (\d+)/(\d+)"
+                r"(?:, general=(\d+)/\d+, mila-reject=(\d+)/\d+)?",
                 msg,
             )
             if m:
@@ -514,29 +562,33 @@ def parse_bridge_status(max_lines: int = 600) -> BridgeStatus:
         if last_turn_set and last_mila_set and attempt_set and test_case_set and started_at_set:
             break
 
-    # Detect running vs finished by checking process + most recent terminal marker
+    # Detect running vs finished by checking the process table
     bproc = bridge_process()
-    if bproc is not None:
-        status.running = True
-    else:
-        # Even if the process isn't running, show the last-known state for
-        # historical context. `running` stays False.
-        status.running = False
+    status.running = bproc is not None
 
-    # Pull the currently-running test case from the cmdline if available
-    # (the bridge log may lag behind process state)
+    # Fall back to the cmdline if the log hasn't caught up with a fresh spawn
     if bproc and not status.test_case:
         cmd = bproc["cmd"]
-        # Format: ... playwright_bridge_bot_headless.py <test_case> <persona> <details> <prompt>
         m = re.search(r"playwright_bridge_bot_headless\.py\s+(.*)$", cmd)
         if m:
-            parts = m.group(1).split(" ", 1)
-            if parts:
-                status.test_case = parts[0][:80]
+            status.test_case = m.group(1).split(" ", 1)[0][:80]
 
+    # Cross-reference with execute log for the run number + persona (those
+    # live in test_execution_<date>.log, not the bridge log)
+    if status.running and not status.run_number:
+        status.run_number = _latest_run_number_from_execute_log()
+    if status.running and not status.persona:
+        status.persona = _latest_persona_from_execute_log()
+
+    # Elapsed-time computation: prefer the log-derived started_at, but fall
+    # back to the process's `ps etime` if the log parser didn't find a
+    # STARTING marker (e.g. a very fresh bridge where the log line hasn't
+    # flushed yet).
     if status.started_at:
         ref = datetime.now() if status.running else (status.last_event_at or datetime.now())
         status.elapsed_sec = max(0.0, (ref - status.started_at).total_seconds())
+    elif status.running and bproc is not None:
+        status.elapsed_sec = float(parse_etime_to_seconds(bproc.get("etime", "")))
 
     return status
 
