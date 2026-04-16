@@ -767,6 +767,7 @@ def wait_for_new_message(page: Page, selector: str, previous_count: int, timeout
                 error_text_patterns = [
                     "something went terribly wrong",
                     "Please try to ask me again",
+                    "Error, please try again",
                 ]
 
                 for pattern in error_text_patterns:
