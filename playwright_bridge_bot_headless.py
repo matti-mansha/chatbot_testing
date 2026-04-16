@@ -13,6 +13,7 @@ ENHANCEMENTS:
 - COMPLETE RESTART STRATEGY: If retry button appears, restart entire test
 """
 import os
+import re
 import time
 import pathlib
 import sys
