@@ -111,6 +111,29 @@ class MilaBackendRejection(RestartTestRequired):
     pass
 
 
+class TesterAPIUnavailable(RestartTestRequired):
+    """
+    Raised when the tester-bot HTTP API (test_bot_headless.py) can't
+    produce a valid user message because its upstream OpenAI key is out
+    of quota / rate-limited / otherwise unusable.
+
+    Observed on 2026-04-17: every chat.completions.create() returned
+    HTTP 429 "You exceeded your current quota". The tester bot caught
+    the error and returned it as a reply string starting with
+    "❌ OpenAI error:". The bridge (before this fix) treated that as a
+    legitimate user message and sent it to Mila, which politely
+    explained what 429 errors mean — polluting every conversation in
+    the test run with nonsense.
+
+    Restarting the bridge won't fix an OpenAI billing issue, so this
+    exception terminates the whole test immediately (retry budget of 0)
+    instead of burning the general MAX_TEST_RESTARTS budget. The run
+    is marked FAILED and the operator can check OpenAI billing to
+    unblock.
+    """
+    pass
+
+
 # =====================================
 # LOAD .env
 # =====================================
@@ -466,15 +489,51 @@ def send_to_tester_api(message: str, retry_count: int = 0) -> Optional[Tuple[str
         if reply.startswith("❌"):
             logger.warning(f"⚠️ Tester returned error response")
             logger.warning(f"   Error: {reply}")
-            
-            # If it's a timeout or rate limit, retry
-            if "timeout" in reply.lower() or "rate limit" in reply.lower():
+            reply_lower = reply.lower()
+
+            # Persistent upstream OpenAI failures — no point retrying, no
+            # point passing this to Mila as a "user message". Abort the
+            # whole test immediately with a clear cause; the operator has
+            # to fix OpenAI billing / the key before anything will work.
+            persistent_upstream = any(
+                s in reply_lower
+                for s in (
+                    "exceeded your current quota",
+                    "insufficient_quota",
+                    "billing",
+                    "invalid_api_key",
+                    "too many consecutive errors",
+                )
+            )
+            if persistent_upstream:
+                logger.error(
+                    "🚨 Tester API upstream (OpenAI) is persistently failing — "
+                    "aborting test immediately. No retry will help."
+                )
+                print(
+                    "🚨 Tester API upstream is down (OpenAI quota/billing). "
+                    "Fix the OpenAI account and rerun."
+                )
+                raise TesterAPIUnavailable(
+                    f"Tester API returned persistent upstream error: {reply[:200]}"
+                )
+
+            # Transient issues (network timeout, temporary rate limit) —
+            # retry inside this request's budget.
+            if "timeout" in reply_lower or "rate limit" in reply_lower:
                 if retry_count < MAX_RETRIES - 1:
                     logger.info(f"⏳ Retrying after {RETRY_DELAY}s...")
                     print(f"⏳ Retrying after {RETRY_DELAY}s (attempt {retry_count + 2}/{MAX_RETRIES})...")
                     time.sleep(RETRY_DELAY)
                     return send_to_tester_api(message, retry_count + 1)
-        
+
+            # Any OTHER ❌-prefixed reply we don't recognize: don't send
+            # garbage to Mila either. Signal failure to the caller with
+            # None; the turn loop's `if result is None` branch will raise
+            # a restart rather than silently pretending the test succeeded.
+            logger.error(f"❌ Unrecognized tester error — returning None to caller")
+            return None
+
         return reply, score, should_continue
         
     except httpx.TimeoutException as e:
@@ -1629,9 +1688,22 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                 # Mila → Tester
                 result = send_to_tester_api(mila_last)
                 if result is None:
-                    logger.error("❌ Tester API failed, stopping")
+                    logger.error("❌ Tester API failed after all retries")
                     print("❌ Tester API failed after all retries")
-                    break
+                    # Do NOT silently break — that would let the outer
+                    # handler report the partial run as success. A dead
+                    # tester API means we have no valid user message to
+                    # send, so this whole test attempt is junk. Raising
+                    # RestartTestRequired surfaces it as an honest failure
+                    # and lets the restart strategy retry in case it was
+                    # a transient network issue. Persistent OpenAI
+                    # billing/quota issues are caught earlier as
+                    # TesterAPIUnavailable and terminate the test
+                    # immediately (no restart).
+                    raise RestartTestRequired(
+                        f"Tester API returned no valid reply after "
+                        f"{MAX_RETRIES} retries on turn {turn}"
+                    )
                 
                 tester_reply, score, should_continue = result
 
@@ -1906,6 +1978,26 @@ def run_bridge_with_restart() -> Tuple[List[Dict[str, str]], int]:
             print(f"{'='*100}\n")
 
             return conversation_log, turns
+
+        except TesterAPIUnavailable as e:
+            # OpenAI / tester-bot infra is down. No retry will fix this —
+            # the operator has to fix billing/key first. Abort immediately
+            # with a distinct failure reason so run_test_executions marks
+            # the execution as [FAILED] and we don't waste the rest of
+            # the queue.
+            logger.error("=" * 100)
+            logger.error(f"🚨 TESTER API UNAVAILABLE: {e.reason}")
+            logger.error(
+                "   No retry — upstream OpenAI issue (quota/billing/auth). "
+                "Fix the OpenAI account and re-run."
+            )
+            logger.error("=" * 100)
+            print(f"\n{'='*100}")
+            print("❌ TESTER API UNAVAILABLE — upstream OpenAI issue")
+            print("   Check OpenAI billing / key, then re-trigger the test run")
+            print(f"{'='*100}\n")
+            print("BRIDGE_FAILURE_REASON=tester_api_unavailable")
+            return [], 0
 
         except MilaBackendRejection as e:
             # Content-induced backend crash. Use the tight retry budget —
