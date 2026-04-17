@@ -21,6 +21,7 @@ import json
 import httpx
 from typing import Any, Optional, List, Dict, Tuple
 from diagnostic_utils import DiagnosticCapture
+from analytics_logger import emit_event as _emit_analytics_event
 from playwright.sync_api import (
     sync_playwright,
     Page,
@@ -1853,7 +1854,30 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                 logger.info(f"  Content: {mila_last[:200]}...")
                 print(f"🟠 Mila reply:\n{mila_last}\n")
                 CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
-                
+
+                # ---- Analytics event: one row per completed turn ----
+                # Captured for downstream analysts per the ANALYTICS_SCHEMA
+                # spec. Includes tester user message, Mila reply (clean —
+                # without [[...]] metadata), Mila self-reported metadata
+                # (empty dict when Mila isn't emitting it yet), and the
+                # tester's completeness score for the turn.
+                _emit_analytics_event(
+                    "turn_recorded",
+                    execution_id=os.getenv("EXECUTION_ID", ""),
+                    run_number=os.getenv("EXECUTION_RUN_NUMBER", ""),
+                    test_case=TEST_CASE,
+                    persona=TEST_PERSONA,
+                    turn_number=turn,
+                    max_turns=MAX_TURNS,
+                    user_message=tester_reply,
+                    user_message_len=len(tester_reply or ""),
+                    mila_reply=mila_last,
+                    mila_reply_len=len(mila_last or ""),
+                    mila_metadata=mila_meta or {},
+                    tester_completeness_score=score,
+                    tester_should_continue=should_continue,
+                )
+
                 # ✨ Capture successful turn completion
                 diagnostics.capture_dom_snapshot(page_mila, f"12_turn{turn}_complete")
                 diagnostics.detect_all_chat_elements(page_mila, f"turn{turn}_complete")

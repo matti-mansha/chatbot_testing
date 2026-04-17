@@ -54,6 +54,11 @@ GZIP_LOG_DAYS = int(os.getenv("GZIP_LOG_DAYS", "3"))
 DELETE_LOG_DAYS = int(os.getenv("DELETE_LOG_DAYS", "30"))
 KEEP_DIAG_DAYS = int(os.getenv("KEEP_DIAG_DAYS", "3"))
 KEEP_SCREENSHOT_DAYS = int(os.getenv("KEEP_SCREENSHOT_DAYS", "3"))
+# Analytics JSONL files are consumed by downstream partners; keep them
+# longer than normal logs so late backfills are possible. Gzip after
+# N days to keep disk usage bounded.
+KEEP_ANALYTICS_DAYS = int(os.getenv("KEEP_ANALYTICS_DAYS", "30"))
+GZIP_ANALYTICS_DAYS = int(os.getenv("GZIP_ANALYTICS_DAYS", "7"))
 
 # Matches filenames like prepare_test_runs_20260415.log or
 # prepare_test_runs_20260415.log.1 (rotated peers).
@@ -191,6 +196,45 @@ def plan_diag_actions() -> List[Action]:
     return actions
 
 
+def plan_analytics_actions() -> List[Action]:
+    """Gzip + delete old analytics JSONL files under logs/analytics/."""
+    actions: List[Action] = []
+    analytics_dir = LOG_DIR / "analytics"
+    if not analytics_dir.exists():
+        return actions
+
+    gzip_cutoff = days_ago(GZIP_ANALYTICS_DAYS)
+    delete_cutoff = days_ago(KEEP_ANALYTICS_DAYS)
+
+    # Match events_YYYYMMDD.jsonl and events_YYYYMMDD.jsonl.gz
+    events_re = re.compile(r"^events_(?P<date>\d{8})\.jsonl(?P<gz>\.gz)?$")
+
+    for p in analytics_dir.iterdir():
+        if not p.is_file():
+            continue
+        m = events_re.match(p.name)
+        if not m:
+            continue
+        date = parse_date(m.group("date"))
+        if date is None:
+            continue
+        try:
+            size = p.stat().st_size
+        except Exception:
+            continue
+        is_gzipped = bool(m.group("gz"))
+
+        if is_gzipped and date < delete_cutoff:
+            actions.append(
+                Action("delete", p, f"analytics gzipped and older than {KEEP_ANALYTICS_DAYS} days", size)
+            )
+        elif not is_gzipped and date < gzip_cutoff:
+            actions.append(
+                Action("gzip", p, f"analytics older than {GZIP_ANALYTICS_DAYS} days", size)
+            )
+    return actions
+
+
 def plan_screenshot_actions() -> List[Action]:
     actions: List[Action] = []
     if not SHOT_DIR.exists():
@@ -288,7 +332,12 @@ def main() -> int:
         )
         print()
 
-    actions = plan_log_actions() + plan_diag_actions() + plan_screenshot_actions()
+    actions = (
+        plan_log_actions()
+        + plan_diag_actions()
+        + plan_screenshot_actions()
+        + plan_analytics_actions()
+    )
     if not actions:
         if not args.quiet:
             print("(nothing to do)")

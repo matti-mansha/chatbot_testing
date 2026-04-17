@@ -18,6 +18,7 @@ import httpx
 # Import the improved formatter
 from format_conversation_page import create_formatted_conversation_page
 from logging_config import setup_logging, log_exception, log_api_call
+from analytics_logger import emit_event as _emit_analytics_event
 
 # =====================================
 # LOAD .env
@@ -409,17 +410,23 @@ def run_playwright_bridge(
     persona: str = "",
     test_case_details: str = "",
     test_case_prompt: str = "",
+    execution_id: str = "",
+    run_number: str = "",
 ) -> Tuple[str, Optional[int], Optional[List[int]]]:
     """
     Run playwright_bridge_bot.py as a subprocess and capture stdout as conversation transcript.
     Returns: (conversation_text, number_of_turns, per_turn_scores)
+
+    execution_id and run_number are passed to the bridge subprocess via
+    env vars (EXECUTION_ID, EXECUTION_RUN_NUMBER) so the bridge's
+    per-turn analytics events can include them as join keys.
     """
     logger.info(f"Running Playwright bridge script: {BRIDGE_SCRIPT}")
     logger.debug(f"  Test case: {test_case_name}")
     logger.debug(f"  Persona: {persona}")
     logger.debug(f"  Details length: {len(test_case_details)} chars")
     logger.debug(f"  Prompt length: {len(test_case_prompt)} chars")
-    
+
     # ✅ FIX: Use virtual environment Python
     python_path = BASE_DIR / "env" / "bin" / "python"
     if not python_path.exists():
@@ -428,7 +435,7 @@ def run_playwright_bridge(
     else:
         python_path = str(python_path)
         logger.debug(f"Using virtual environment Python: {python_path}")
-    
+
     cmd = [
         python_path,  # ✅ NOW USES VENV PYTHON
         BRIDGE_SCRIPT,
@@ -437,10 +444,19 @@ def run_playwright_bridge(
         test_case_details or "",
         test_case_prompt or "",
     ]
-    
+
     print(f"   ▶ Running: python {BRIDGE_SCRIPT}")
     print(f"   📝 Test case: {test_case_name}")
     print(f"   👤 Persona: {persona}")
+
+    # Pass execution context through to the bridge subprocess via env
+    # (not argv — keeps the argv-positional contract clean, and the
+    # bridge already has a lot of prompt text on argv[4]).
+    bridge_env = os.environ.copy()
+    if execution_id:
+        bridge_env["EXECUTION_ID"] = execution_id
+    if run_number:
+        bridge_env["EXECUTION_RUN_NUMBER"] = run_number
 
     try:
         start_time = time.time()
@@ -449,6 +465,7 @@ def run_playwright_bridge(
             cwd=str(BASE_DIR),
             capture_output=True,
             text=True,
+            env=bridge_env,
         )
         duration = time.time() - start_time
 
@@ -566,6 +583,17 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
         logger.warning(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
         print(f"   ⚠️ Could not set 'Test Execustion Started': {e}")
 
+    # ---- Analytics event: execution starting --------------------------
+    _emit_analytics_event(
+        "execution_started",
+        execution_id=page_id,
+        run_number=run_number,
+        test_case=test_case_name,
+        persona=persona,
+        test_case_prompt_len=len(test_case_prompt or ""),
+        test_case_details_len=len(test_case_details or ""),
+    )
+
     # Run the bridge
     start_ts = time.monotonic()
     conversation_text, number_of_turns, per_turn_scores, bridge_failed = run_playwright_bridge(
@@ -573,6 +601,8 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
         persona=persona,
         test_case_details=test_case_details,
         test_case_prompt=test_case_prompt,
+        execution_id=page_id,
+        run_number=run_number,
     )
     duration = time.monotonic() - start_ts
 
@@ -626,6 +656,25 @@ def process_single_execution(execution: Dict[str, Any], test_exec_db_id: str) ->
         duration_seconds=duration,
         conversation_page_id=conv_page_id,
         number_of_turns=number_of_turns,
+    )
+
+    # ---- Analytics event: execution complete --------------------------
+    conv_url = None
+    if conv_page_id:
+        conv_url = f"https://www.notion.so/{conv_page_id.replace('-', '')}"
+    _emit_analytics_event(
+        "execution_completed",
+        execution_id=page_id,
+        run_number=run_number,
+        test_case=test_case_name,
+        persona=persona,
+        outcome="failed" if bridge_failed else "success",
+        num_turns=number_of_turns,
+        duration_sec=duration,
+        per_turn_scores=per_turn_scores or [],
+        conversation_page_id=conv_page_id,
+        conversation_page_url=conv_url,
+        terminal_status=terminal_status,
     )
 
     if bridge_failed:

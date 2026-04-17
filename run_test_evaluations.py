@@ -23,6 +23,7 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 from logging_config import setup_logging, log_exception, log_api_call
+from analytics_logger import emit_event as _emit_analytics_event
 
 # =====================================
 # LOAD .env
@@ -1084,6 +1085,37 @@ def process_single_evaluation(execution: Dict[str, Any], test_exec_db_id: str, t
         error=error,
         evaluation_page_id=evaluation_page_id,
     )
+
+    # ---- Analytics event: evaluation complete (full 9-KPI + overall) -------
+    # This is the row analytics partners care about most — one JSON line
+    # with everything needed to compute any aggregate KPI without
+    # re-fetching from Notion. Fields mirror the EvaluationOutput Pydantic
+    # model exactly. See docs/ANALYTICS_SCHEMA.md.
+    try:
+        eval_url = None
+        if evaluation_page_id:
+            eval_url = f"https://www.notion.so/{evaluation_page_id.replace('-', '')}"
+        overall = (parsed or {}).get("overall", {}) if isinstance(parsed, dict) else {}
+        kpis_flat = (parsed or {}).get("kpis", {}) if isinstance(parsed, dict) else {}
+        summary = (parsed or {}).get("summary_of_goal", "") if isinstance(parsed, dict) else ""
+        _emit_analytics_event(
+            "evaluation_completed",
+            execution_id=page_id,
+            run_number=test_run_number,
+            test_case=test_case_name,
+            persona=persona,
+            overall_score=overall.get("overall_score"),
+            overall_result=overall.get("result"),
+            overall_comment=overall.get("comment"),
+            summary_of_goal=summary,
+            kpis=kpis_flat,
+            evaluation_page_id=evaluation_page_id,
+            evaluation_page_url=eval_url,
+            evaluator_duration_sec=duration,
+            evaluator_error=error or None,
+        )
+    except Exception as _e:
+        logger.warning(f"analytics emit (evaluation_completed) failed: {_e}")
 
     # Update Test Run statistics
     if parsed and isinstance(parsed, dict) and test_runs_db_id:
