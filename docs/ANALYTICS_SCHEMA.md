@@ -3,50 +3,95 @@
 The MILA chatbot testing pipeline emits structured events to:
 
 ```
-logs/analytics/events_YYYYMMDD.jsonl
+logs/analytics/events_YYYYMMDD.txt
 ```
 
-One JSON object per line. One file per UTC day. Safe to tail, rsync, or
-bulk-load. Used by the analytics partner to compute bespoke metrics on
-top of what the operational dashboard already shows.
+Each event is a pretty-printed JSON object wrapped in **double square
+brackets** (`[[ ... ]]`), per the project-agreed chat-metadata format
+(from the "Website chat - add chat metadata" issue). Events are
+separated by a blank line.
 
-## Quick start
+Example event:
 
-### Python / pandas
+```
+[[
+{
+  "event_type": "evaluation_completed",
+  "event_id": "f53a2daa24d54470805020242fdbdd29",
+  "ts": "2026-04-17T12:35:54.719629+00:00",
+  "execution_id": "343af83c-f3e4-81eb-941d-dd4bdca938cd",
+  "run_number": "TR1.TC60.5",
+  "test_case": "Partial info: name known, email missing",
+  "persona": "Cooperative user",
+  "overall_score": 72,
+  "overall_result": "PARTIAL",
+  "overall_comment": "...",
+  "summary_of_goal": "...",
+  "kpis": {
+    "task_completeness": { "score": 75, "comment": "..." },
+    "user_comfort": { "score": 80, "comment": "..." },
+    ...
+  },
+  "evaluation_page_url": "https://www.notion.so/...",
+  "evaluator_duration_sec": 29.3,
+  "evaluator_error": null
+}
+]]
+```
+
+One file per UTC day. Safe to tail, rsync, or bulk-load.
+
+## Downloading
+
+The files are served over HTTPS from the dashboard host, gated by the
+same Basic Auth credentials as the dashboard itself:
+
+```
+https://<host>/analytics/                            # directory listing
+https://<host>/analytics/events_YYYYMMDD.txt         # today's file
+```
+
+## Parsing
+
+Because every event is a `[[ ... ]]`-wrapped JSON object, a one-line
+regex extracts all events from a day's file:
+
+### Python (pandas)
 
 ```python
-import pandas as pd
+import re, json, pandas as pd
 
-df = pd.read_json('events_20260417.jsonl', lines=True)
+with open('events_20260417.txt') as f:
+    raw = f.read()
 
-# All 14 aggregate KPIs can be computed from evaluation_completed rows
+blocks = re.findall(r'\[\[\s*(\{.*?\})\s*\]\]', raw, re.DOTALL)
+events = [json.loads(b) for b in blocks]
+df = pd.DataFrame(events)
+
+# Only evaluation results (one row per evaluated execution)
 evals = df[df.event_type == 'evaluation_completed']
-evals[['run_number', 'test_case', 'overall_score', 'overall_result']]
+print(evals[['run_number','test_case','overall_score','overall_result']])
 ```
 
-### jq / shell
+### Shell (awk + jq)
 
 ```bash
-# All evaluations today, with score + result
-jq -c 'select(.event_type=="evaluation_completed") | {run_number, test_case, overall_score, overall_result}' \
-    events_$(date +%Y%m%d).jsonl
-
-# All MILA metadata emitted so far (per-turn, shipped once MILA emits [[...]])
-jq -c 'select(.event_type=="turn_recorded" and (.mila_metadata|length>0)) | {run_number, test_case, turn_number, mila_metadata}' \
-    events_*.jsonl
+# Extract every JSON block from a day's file and pipe into jq
+awk '/^\[\[/ {inblock=1; next} /^\]\]/ {inblock=0; print ""; next} inblock' \
+    events_20260417.txt \
+| jq -s 'map(select(.event_type=="evaluation_completed"))'
 ```
 
-### duckdb
+### Multi-day bulk load
 
-```sql
-CREATE VIEW evals AS
-  SELECT * FROM read_json_auto('logs/analytics/events_*.jsonl', format='newline_delimited')
-  WHERE event_type = 'evaluation_completed';
-
-SELECT test_case, AVG(overall_score), COUNT(*)
-FROM evals
-GROUP BY test_case
-ORDER BY 2 ASC;
+```python
+import glob, re, json, pandas as pd
+all_events = []
+for path in glob.glob('events_*.txt'):
+    raw = open(path).read()
+    for b in re.findall(r'\[\[\s*(\{.*?\})\s*\]\]', raw, re.DOTALL):
+        all_events.append(json.loads(b))
+df = pd.DataFrame(all_events)
 ```
 
 ## Common fields (every event)
@@ -106,15 +151,13 @@ Emitted by `run_test_executions.py` after the bridge subprocess exits
 | `per_turn_scores` | array of int | Per-turn completeness scores from the tester bot (ordered by turn) |
 | `conversation_page_id` | string \| null | Notion page ID of the formatted conversation page |
 | `conversation_page_url` | string \| null | Browser URL of the conversation page |
-| `terminal_status` | string | The `Test Execution Status` value written to Notion: `"Test Executed"` on success, `"Test Execustion Started"` (sic) or another configured value on failure |
+| `terminal_status` | string | The `Test Execution Status` value written to Notion |
 
 ### `evaluation_completed`
 
 Emitted by `run_test_evaluations.py` after OpenAI scores the
 conversation. **This is the row analytics partners want most** — it
-contains the full 9-KPI rubric + overall verdict in a single line.
-One per evaluation (some executions may not reach evaluation if they
-failed).
+contains the full 9-KPI rubric + overall verdict in a single event.
 
 | Field | Type | Description |
 |---|---|---|
@@ -142,22 +185,22 @@ Pydantic model):
 - `efficiency_and_flow`
 
 Each value is an object:
-```json
-{"score": 72, "comment": "..."}
+```
+{ "score": 72, "comment": "..." }
 ```
 
 ## Event lifecycle
 
-For a single test case execution the stream looks like:
+For a single test case execution the stream looks like (separator
+blank lines omitted):
 
 ```
-{event_type: "execution_started",  turn:-, ts:T0, execution_id:E}
-{event_type: "turn_recorded",      turn:1, ts:T0+30s, execution_id:E, mila_metadata:{}}
-{event_type: "turn_recorded",      turn:2, ts:T0+60s, execution_id:E, mila_metadata:{"zielerreichung":7}}
-{event_type: "turn_recorded",      turn:3, ts:T0+90s, execution_id:E, mila_metadata:{"zielerreichung":8}}
+[[ { event_type: "execution_started",   turn:-, ts:T0,      execution_id:E } ]]
+[[ { event_type: "turn_recorded",       turn:1, ts:T0+30s,  execution_id:E, mila_metadata:{} } ]]
+[[ { event_type: "turn_recorded",       turn:2, ts:T0+60s,  execution_id:E, mila_metadata:{"zielerreichung":7} } ]]
 ... (up to MAX_TURNS or early-exit)
-{event_type: "execution_completed", turn:-, ts:T0+5m, execution_id:E, outcome:"success", num_turns:5}
-{event_type: "evaluation_completed",turn:-, ts:T0+6m, execution_id:E, overall_score:72, kpis:{...}}
+[[ { event_type: "execution_completed", turn:-, ts:T0+5m,   execution_id:E, outcome:"success", num_turns:5 } ]]
+[[ { event_type: "evaluation_completed",turn:-, ts:T0+6m,   execution_id:E, overall_score:72, kpis:{...} } ]]
 ```
 
 Failed executions skip the `evaluation_completed` event. They still emit
@@ -166,10 +209,11 @@ and usually partial turn records up to the failure point).
 
 ## Retention
 
-`log_retention.py` runs daily and deletes `events_*.jsonl` older than
-`KEEP_ANALYTICS_DAYS` (default **30 days** — longer than normal logs
-since analytics consumers may backfill). Copy or rsync to a
-long-term-retention bucket if you need beyond 30 days.
+`log_retention.py` runs daily and:
+- Gzips `events_*.txt` older than `GZIP_ANALYTICS_DAYS` (default 7).
+- Deletes `events_*.txt.gz` older than `KEEP_ANALYTICS_DAYS` (default 30).
+
+Copy or rsync to a long-term-retention bucket if you need beyond 30 days.
 
 ## Stability guarantees
 
@@ -177,6 +221,8 @@ long-term-retention bucket if you need beyond 30 days.
 - Renaming or removing existing fields is breaking; ask before doing it.
 - `event_id` is suitable as a unique key for idempotent ingestion.
 - `execution_id` is stable per execution; join on it across event types.
+- The `[[ ... ]]` wrapper and blank-line separator are part of the format
+  contract — parsers should rely on them.
 - `ts` is monotonically non-decreasing *within* a single process but
   may be slightly out-of-order across bridge subprocess vs. parent
   process events (µs-scale). Consumers should sort on `ts` if ordering

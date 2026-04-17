@@ -206,8 +206,9 @@ def plan_analytics_actions() -> List[Action]:
     gzip_cutoff = days_ago(GZIP_ANALYTICS_DAYS)
     delete_cutoff = days_ago(KEEP_ANALYTICS_DAYS)
 
-    # Match events_YYYYMMDD.jsonl and events_YYYYMMDD.jsonl.gz
-    events_re = re.compile(r"^events_(?P<date>\d{8})\.jsonl(?P<gz>\.gz)?$")
+    # Match events_YYYYMMDD.txt and events_YYYYMMDD.txt.gz (current format)
+    # plus the legacy .jsonl naming in case old files are around.
+    events_re = re.compile(r"^events_(?P<date>\d{8})\.(?:txt|jsonl)(?P<gz>\.gz)?$")
 
     for p in analytics_dir.iterdir():
         if not p.is_file():

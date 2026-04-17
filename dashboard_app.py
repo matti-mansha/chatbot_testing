@@ -1443,13 +1443,13 @@ def render_kpis_tab() -> None:
     with exp_col1:
         st.link_button(
             f"📥 Today's events ({_today})",
-            f"/analytics/events_{_today}.jsonl",
+            f"/analytics/events_{_today}.txt",
             use_container_width=True,
         )
     with exp_col2:
         st.link_button(
             f"📥 Yesterday ({_yday})",
-            f"/analytics/events_{_yday}.jsonl",
+            f"/analytics/events_{_yday}.txt",
             use_container_width=True,
         )
     with exp_col3:
@@ -1459,7 +1459,8 @@ def render_kpis_tab() -> None:
             use_container_width=True,
         )
     st.caption(
-        "📊 Analytics JSONL event stream — schema: `docs/ANALYTICS_SCHEMA.md`. "
+        "📊 Analytics event stream — `[[...]]` wrapped JSON per the "
+        "project chat-metadata format. Schema: `docs/ANALYTICS_SCHEMA.md`. "
         "Share these links (with Basic Auth credentials) with your analytics partner."
     )
 
