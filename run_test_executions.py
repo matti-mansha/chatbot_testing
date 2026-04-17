@@ -7,7 +7,6 @@ Runs in a loop like prepare_test_runs.py
 import os
 import time
 import pathlib
-from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import subprocess
@@ -53,27 +52,12 @@ CHECK_INTERVAL = int(os.getenv("EXECUTION_CHECK_INTERVAL", "10"))  # seconds
 EXECUTION_SUCCESS_STATUS = os.getenv("EXECUTION_SUCCESS_STATUS", "Test Executed")
 EXECUTION_FAILED_STATUS = os.getenv("EXECUTION_FAILED_STATUS", "Test Execustion Started")
 
-# How many bridge subprocesses can run concurrently.
-#
-# Default is 1 (serial). Per-bridge client state is fully isolated
-# (separate Playwright browser context, separate cookie jar, separate
-# login → separate Drupal session cookie, separate per-context
-# sessionStorage for the widget's client-side chat history), so the
-# browser side is parallel-safe.
-#
-# The reason for the conservative default is the SERVER side. Mila's
-# xi-deepchat API request body contains no conversation_id or thread_id
-# — only assistant_id and the hardcoded contexts.current_route — so
-# conversation state on the backend must be keyed by something derived
-# from the request (session cookie or Drupal user_id). Without being
-# able to read the Drupal module source, we can't prove the backend
-# isn't keyed on user_id, in which case parallel workers using the same
-# MILA account would all share/corrupt each other's conversation thread.
-#
-# To safely use EXECUTION_PARALLELISM > 1, use a pool of distinct MILA
-# accounts (one per worker). Until account pooling is implemented here,
-# set this to 1. You can still override via env var for experiments.
-EXECUTION_PARALLELISM = int(os.getenv("EXECUTION_PARALLELISM", "1"))
+# Pipeline is strictly SERIAL — process one execution at a time. Previous
+# versions ran a ThreadPoolExecutor with EXECUTION_PARALLELISM workers,
+# but with a single shared MILA account the parallel bridges couldn't
+# reliably avoid server-side conversation-state contamination (MILA's
+# chat API doesn't expose a per-session conversation ID). Until we have
+# a pool of distinct MILA accounts, serial is the only correct mode.
 
 # Notion API
 NOTION_API_BASE = "https://api.notion.com/v1"
@@ -714,58 +698,32 @@ def verify_env() -> bool:
 
 def run_execution_loop(check_interval: int = 10):
     """
-    Continuously monitor for pending test executions and dispatch them to
-    a pool of EXECUTION_PARALLELISM worker threads.
+    Continuously monitor for pending test executions and process them
+    one at a time, in sequence. Simple serial loop — no threads, no
+    futures, no concurrency.
 
-    Threading model
-    ---------------
-    The main thread polls Notion every `check_interval` seconds. Each pending
-    execution it finds is handed to a ThreadPoolExecutor via submit(). Each
-    worker calls process_single_execution(), which is self-contained:
-        1. marks the execution as "Test Execustion Started"
-        2. spawns the bridge subprocess and waits for it
-        3. uploads the conversation page
-        4. updates the row to SUCCESS_STATUS or FAILED_STATUS
-    Workers spend most of their wall-clock time inside subprocess.run() on
-    the bridge, which releases the GIL, so Python threads work well here.
+        while True:
+            for each pending execution (newest first):
+                process it end-to-end
+            sleep check_interval
 
-    Race avoidance
-    --------------
-    Between polling iterations, Notion may still report an execution as
-    "Not started" for a few seconds after a worker has picked it up but
-    before the "Test Execustion Started" PATCH propagates. We track an
-    `in_flight` set of execution IDs locally and skip any execution whose
-    ID is already being processed. This plus the server-side Notion PATCH
-    gives us at-most-once dispatch.
+    process_single_execution() is self-contained — it marks the row
+    'Test Execustion Started', spawns the bridge subprocess and waits
+    for it, uploads the conversation page, and finally updates the row
+    to 'Test Executed' (success) or leaves it 'Test Execustion Started'
+    with a [FAILED] conversation page (failure).
 
-    Back-pressure
-    -------------
-    If all EXECUTION_PARALLELISM slots are full, we simply don't submit
-    more work that iteration and re-query next tick. No queue buildup —
-    each iteration only fills empty slots. Prevents runaway chromium
-    spawning when Mila is slow.
+    Why serial instead of parallel? The previous implementation used a
+    ThreadPoolExecutor with EXECUTION_PARALLELISM workers. With a
+    single shared MILA account, parallel bridges can't reliably avoid
+    server-side state contamination (MILA's chat API doesn't expose a
+    per-session conversation ID). Restore parallelism only after we
+    have a pool of distinct MILA accounts (MILA_ACCOUNT_POOL design).
     """
     logger.info("=" * 80)
-    if EXECUTION_PARALLELISM == 1:
-        logger.info("🚀 Test Execution Service Started (Serial Mode, workers=1)")
-        print("🚀 Test Execution Service Started (Serial Mode, workers=1)")
-    else:
-        logger.info(
-            f"🚀 Test Execution Service Started (Parallel Mode, workers={EXECUTION_PARALLELISM})"
-        )
-        logger.warning(
-            f"⚠️  PARALLELISM > 1 with a single MILA account is RISKY. Mila's "
-            f"xi-deepchat backend may key conversation state by user_id, which "
-            f"would cause cross-contamination between concurrent workers. Only "
-            f"use this if you have confirmed MILA isolates per session."
-        )
-        print(
-            f"🚀 Test Execution Service Started (Parallel Mode, workers={EXECUTION_PARALLELISM})"
-        )
-        print(
-            f"⚠️  WARNING: parallelism > 1 with a single MILA account is risky — "
-            f"MILA may mix conversation state across parallel workers."
-        )
+    logger.info("🚀 Test Execution Service Started (serial, one-at-a-time)")
+    logger.info("=" * 80)
+    print("🚀 Test Execution Service Started (serial, one-at-a-time)")
 
     if not verify_env():
         return
@@ -784,128 +742,56 @@ def run_execution_loop(check_interval: int = 10):
     print(f"⏰ Checking every {check_interval} seconds...\n")
 
     iteration = 0
-    pool = ThreadPoolExecutor(
-        max_workers=EXECUTION_PARALLELISM,
-        thread_name_prefix="test-exec",
-    )
-    in_flight: Dict[str, Future] = {}  # execution_page_id -> Future
-
-    def _worker_wrap(exec_dict: Dict[str, Any], db_id: str, page_id: str) -> bool:
-        """Thread target. Wraps process_single_execution with try/except so
-        a worker crash can't take down the whole service."""
+    while True:
         try:
-            return process_single_execution(exec_dict, db_id)
+            iteration += 1
+            logger.debug(f"Check iteration #{iteration}")
+
+            pending = get_pending_executions(test_exec_db_id)
+
+            if not pending:
+                logger.debug("💤 No pending executions")
+                print("💤 No pending executions...", end="\r")
+                time.sleep(check_interval)
+                continue
+
+            logger.info(f"🔔 Found {len(pending)} pending execution(s)")
+            print(f"\n🔔 Found {len(pending)} pending execution(s)")
+
+            # Process them ONE AT A TIME, in order (newest-first per
+            # get_pending_executions' sort). Each call blocks until the
+            # bridge subprocess exits. This is intentional — see docstring.
+            for idx, exec_dict in enumerate(pending, start=1):
+                page_id = exec_dict.get("id", "")
+                logger.info(f"\n[{idx}/{len(pending)}] Processing {page_id}")
+                print(f"\n[{idx}/{len(pending)}] Processing {page_id}")
+                try:
+                    ok = process_single_execution(exec_dict, test_exec_db_id)
+                    if ok:
+                        logger.info(f"✅ {idx}/{len(pending)} completed")
+                        print(f"✅ {idx}/{len(pending)} completed")
+                    else:
+                        logger.warning(f"⚠️ {idx}/{len(pending)} had failures (see conversation page)")
+                        print(f"⚠️ {idx}/{len(pending)} had failures")
+                except Exception as e:
+                    log_exception(logger, e, f"process_single_execution[{idx}]")
+                    logger.error(f"❌ Crash on {page_id}: {e}")
+                    print(f"❌ Crash on {page_id}: {e}")
+                    # Keep going with the next execution
+
+            time.sleep(check_interval)
+
+        except KeyboardInterrupt:
+            logger.warning("\n👋 Shutting down...")
+            print("\n\n👋 Shutting down...")
+            break
         except Exception as e:
-            log_exception(logger, e, f"worker_process_{page_id}")
-            logger.error(f"❌ Worker crashed on execution {page_id}: {e}")
-            return False
-
-    try:
-        while True:
-            try:
-                iteration += 1
-                logger.debug(f"Check iteration #{iteration}")
-
-                # --- 1. Reap completed workers --------------------------
-                for eid, fut in list(in_flight.items()):
-                    if fut.done():
-                        try:
-                            ok = fut.result()
-                            if ok:
-                                logger.info(f"✅ Worker finished execution {eid}")
-                            else:
-                                logger.warning(f"⚠️ Worker finished execution {eid} with failure")
-                        except Exception as e:
-                            log_exception(logger, e, f"reap_{eid}")
-                            logger.error(f"❌ Worker result raised: {e}")
-                        del in_flight[eid]
-
-                slots_free = EXECUTION_PARALLELISM - len(in_flight)
-                logger.debug(
-                    f"in_flight={len(in_flight)}/{EXECUTION_PARALLELISM}, "
-                    f"slots_free={slots_free}"
-                )
-
-                if slots_free <= 0:
-                    # All workers busy — don't even bother polling Notion.
-                    # This is back-pressure: we won't spawn more chromiums
-                    # than the pool's capacity, even if 28 executions are
-                    # pending.
-                    print(
-                        f"🔥 All {EXECUTION_PARALLELISM} workers busy ({', '.join(in_flight.keys())[:80]}…)",
-                        end="\r",
-                    )
-                    time.sleep(check_interval)
-                    continue
-
-                # --- 2. Fetch pending executions ------------------------
-                pending = get_pending_executions(test_exec_db_id)
-
-                if not pending and not in_flight:
-                    logger.debug("💤 No pending executions, no workers active")
-                    print("💤 No pending executions...", end="\r")
-                    time.sleep(check_interval)
-                    continue
-
-                # --- 3. Dispatch up to slots_free new workers -----------
-                dispatched = 0
-                for exec_dict in pending:
-                    if slots_free <= 0:
-                        break
-                    page_id = exec_dict.get("id", "")
-                    if not page_id:
-                        continue
-                    if page_id in in_flight:
-                        # Already being processed — skip (race: Notion may
-                        # return it again until the status PATCH propagates).
-                        continue
-
-                    logger.info(
-                        f"🚀 Dispatching execution {page_id} to worker "
-                        f"({len(in_flight)+1}/{EXECUTION_PARALLELISM} slots used)"
-                    )
-                    print(
-                        f"\n🚀 Dispatching {page_id[:8]}… "
-                        f"({len(in_flight)+1}/{EXECUTION_PARALLELISM} slots)"
-                    )
-                    fut = pool.submit(_worker_wrap, exec_dict, test_exec_db_id, page_id)
-                    in_flight[page_id] = fut
-                    slots_free -= 1
-                    dispatched += 1
-
-                if dispatched == 0 and in_flight:
-                    # Nothing new was dispatched but we still have workers
-                    # running — show a compact progress line.
-                    print(
-                        f"🔄 {len(in_flight)} worker(s) running, 0 dispatched this tick",
-                        end="\r",
-                    )
-                elif dispatched > 0:
-                    logger.info(
-                        f"✓ Dispatched {dispatched} new execution(s). "
-                        f"in_flight={len(in_flight)}/{EXECUTION_PARALLELISM}"
-                    )
-
-                time.sleep(check_interval)
-
-            except KeyboardInterrupt:
-                logger.warning("\n👋 Shutting down...")
-                print("\n\n👋 Shutting down...")
-                break
-            except Exception as e:
-                log_exception(logger, e, "execution loop")
-                logger.error(f"\n❌ Error in execution loop: {e}")
-                print(f"\n❌ Error in execution loop: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(check_interval)
-    finally:
-        logger.info(f"Shutting down thread pool ({len(in_flight)} workers still running)")
-        print(f"Shutting down thread pool ({len(in_flight)} workers still running)")
-        # wait=True lets each in-flight bridge finish naturally; cancel_futures
-        # kills work that hasn't started yet (there shouldn't be any since we
-        # never queue beyond EXECUTION_PARALLELISM).
-        pool.shutdown(wait=True, cancel_futures=True)
+            log_exception(logger, e, "execution loop")
+            logger.error(f"\n❌ Error in execution loop: {e}")
+            print(f"\n❌ Error in execution loop: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(check_interval)
 
 
 # =====================================
