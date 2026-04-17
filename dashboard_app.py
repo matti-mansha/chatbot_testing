@@ -1433,6 +1433,36 @@ def render_kpis_tab() -> None:
     run_status = runs[sel_idx][5] or "—"
     num_total = runs[sel_idx][4]
 
+    # --- Analytics export callout (for the downstream analytics partner) ---
+    # Show a compact row with direct download links for today's and
+    # yesterday's JSONL event streams. Both URLs are served by nginx at
+    # /analytics/ behind the same Basic Auth as the dashboard itself.
+    _today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    _yday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
+    exp_col1, exp_col2, exp_col3 = st.columns([2, 2, 3])
+    with exp_col1:
+        st.link_button(
+            f"📥 Today's events ({_today})",
+            f"/analytics/events_{_today}.jsonl",
+            use_container_width=True,
+        )
+    with exp_col2:
+        st.link_button(
+            f"📥 Yesterday ({_yday})",
+            f"/analytics/events_{_yday}.jsonl",
+            use_container_width=True,
+        )
+    with exp_col3:
+        st.link_button(
+            "📂 Browse all analytics",
+            "/analytics/",
+            use_container_width=True,
+        )
+    st.caption(
+        "📊 Analytics JSONL event stream — schema: `docs/ANALYTICS_SCHEMA.md`. "
+        "Share these links (with Basic Auth credentials) with your analytics partner."
+    )
+
     payload = _kpi_payload_for_run(run_prefix)
     if not payload:
         st.warning(f"No evaluated executions for {run_prefix} yet.")
