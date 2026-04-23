@@ -56,6 +56,20 @@ if OPENAI_API_KEY and OPENAI_AVAILABLE:
     logger.info("✓ OpenAI client initialized")
 
 
+class TesterJSONParseError(Exception):
+    """
+    Raised when the tester model's reply cannot be parsed as the required
+    JSON shape ({"message": ..., "completeness_score": ..., "should_continue": ...}).
+
+    get_response() catches this, retries the OpenAI call ONCE with a
+    strict corrective prompt ("return valid JSON only, no prose"), and if
+    the retry also fails returns an ❌-prefixed error reply. The bridge
+    recognises ❌-prefixed replies and escalates to RestartTestRequired
+    rather than sending garbage into Mila's chat.
+    """
+    pass
+
+
 class TestBotSession:
     """Manages a single test session"""
     
@@ -108,39 +122,61 @@ class TestBotSession:
     
     def parse_json_response(self, reply: str) -> Tuple[str, Optional[int], bool]:
         """
-        Parse JSON response from AI.
-        
-        Returns: (message, score, should_continue)
+        Parse a strict JSON response from the tester model.
+
+        Returns (message, score, should_continue) on success.
+
+        Raises TesterJSONParseError on any parse failure. Previously this
+        method silently returned the raw reply with should_continue=True
+        on JSONDecodeError, which meant non-JSON garbage from OpenAI was
+        pasted verbatim into Mila's chat as if it were a legitimate user
+        message — contaminating the whole test run with no visible error.
+        Raising lets the caller retry once with a stricter reminder and,
+        if that also fails, surface a hard error to the bridge so the
+        restart machinery kicks in.
         """
         logger.debug(f"Parsing JSON response ({len(reply)} chars)")
-        
+
+        clean_reply = (reply or "").strip()
+        if clean_reply.startswith("```"):
+            lines = clean_reply.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            clean_reply = "\n".join(lines).strip()
+
         try:
-            clean_reply = reply.strip()
-            if clean_reply.startswith("```"):
-                lines = clean_reply.split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                clean_reply = "\n".join(lines).strip()
-            
             data = json.loads(clean_reply)
-            message = data.get("message", "")
-            score = data.get("completeness_score")
-            should_continue = data.get("should_continue", True)
-            
-            if score is not None:
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TesterJSONParseError(
+                f"Not valid JSON: {e}; first 200 chars of reply: {clean_reply[:200]!r}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise TesterJSONParseError(
+                f"Top-level JSON is not an object (got {type(data).__name__}); "
+                f"first 200 chars: {clean_reply[:200]!r}"
+            )
+
+        message = data.get("message", "")
+        score = data.get("completeness_score")
+        should_continue = data.get("should_continue", True)
+
+        if score is not None:
+            try:
                 score = int(score)
                 score = max(1, min(100, score))
-            
-            logger.debug(f"Parsed: message={len(message)} chars, score={score}, should_continue={should_continue}")
-            self.error_count = 0  # ✅ Reset error count on success
-            return message, score, should_continue
-            
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
-            logger.warning(f"JSON parse failed, returning raw reply: {e}")
-            self.error_count += 1
-            return reply, None, True
+            except (TypeError, ValueError) as e:
+                raise TesterJSONParseError(
+                    f"completeness_score is not an int: {score!r} ({e})"
+                ) from e
+
+        logger.debug(
+            f"Parsed: message={len(message)} chars, score={score}, "
+            f"should_continue={should_continue}"
+        )
+        return message, score, should_continue
     
     def get_response(self, user_message: str) -> Tuple[str, Optional[int], bool]:
         """
@@ -188,40 +224,109 @@ class TestBotSession:
         
         try:
             start_time = time.time()
-            
+
             # ✅ ADD TIMEOUT TO OPENAI CALL
             resp = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=messages,
                 timeout=OPENAI_TIMEOUT,  # ✅ NEW: Add explicit timeout
             )
-            
+
             duration = time.time() - start_time
             logger.debug(f"OpenAI response received in {duration:.2f}s")
-            
+
             reply = resp.choices[0].message.content
-            message, score, should_continue = self.parse_json_response(reply)
-            
+
+            try:
+                message, score, should_continue = self.parse_json_response(reply)
+            except TesterJSONParseError as parse_err:
+                # First attempt was not parseable JSON. Retry ONCE with an
+                # explicit corrective turn appended to the conversation. We
+                # do NOT persist either the bad assistant reply or the
+                # corrective user message to self.chat_history — on
+                # success the final (valid) reply is what gets persisted
+                # below, keeping the session's conversation model
+                # consistent with what Mila's side has observed.
+                logger.warning(
+                    f"⚠️ Tester JSON parse failed on first attempt: {parse_err} — "
+                    f"retrying once with strict reminder"
+                )
+                self.error_count += 1
+                retry_messages = list(messages) + [
+                    {"role": "assistant", "content": reply or ""},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response was NOT valid JSON and could not be "
+                            "parsed. Respond NOW with the EXACT JSON object — nothing "
+                            "else, no prose, no markdown code fences:\n"
+                            '{"message": "<your user message here>", '
+                            '"completeness_score": <integer 1-100>, '
+                            '"should_continue": <true or false>}'
+                        ),
+                    },
+                ]
+                try:
+                    resp2 = openai_client.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=retry_messages,
+                        timeout=OPENAI_TIMEOUT,
+                    )
+                    reply2 = resp2.choices[0].message.content
+                    message, score, should_continue = self.parse_json_response(reply2)
+                    logger.info("✓ Retry produced valid JSON")
+                except TesterJSONParseError as parse_err2:
+                    logger.error(
+                        f"❌ Tester JSON retry ALSO failed: {parse_err2} — "
+                        f"surfacing hard error to bridge"
+                    )
+                    self.error_count += 1
+                    # ❌-prefixed reply is recognised by the bridge's
+                    # send_to_tester_api: the string doesn't match any of
+                    # the "persistent upstream" patterns (quota/billing/
+                    # invalid_api_key), so it falls through to the
+                    # "unrecognised ❌ reply" branch which returns None
+                    # to the turn loop, which raises RestartTestRequired.
+                    # The test is retried from scratch; after
+                    # MAX_TEST_RESTARTS it's marked failed rather than
+                    # running on corrupted input.
+                    return (
+                        f"❌ Tester JSON parse failed after retry: {parse_err2}",
+                        None,
+                        False,
+                    )
+                except Exception as retry_err:
+                    log_exception(logger, retry_err, "OpenAI retry after JSON parse failure")
+                    self.error_count += 1
+                    return (
+                        f"❌ Tester retry error: {retry_err}",
+                        None,
+                        False,
+                    )
+
+            # Parse (initial or retry) succeeded.
+            self.error_count = 0
+
             # Save to history
             self.chat_history.append({
                 "user": user_message,
                 "assistant": message
             })
-            
+
             if score is not None:
                 self.score_history.append(score)
                 logger.info(f"✓ Response received with score: {score}/100, should_continue: {should_continue}")
             else:
                 logger.info(f"✓ Response received (no score), should_continue: {should_continue}")
-            
+
             logger.debug(f"Message preview: {message[:100]}...")
             return message, score, should_continue
-        
+
         except Exception as e:
             log_exception(logger, e, "OpenAI API call")
             logger.error(f"❌ OpenAI error: {e}")
             self.error_count += 1
-            
+
             # ✅ Return different messages based on error type
             error_str = str(e).lower()
             if "timeout" in error_str:

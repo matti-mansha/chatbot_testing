@@ -1656,15 +1656,23 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
             # what we show the tester bot and persist in the transcript;
             # the raw metadata is logged separately for KPI + debugging.
             mila_last, mila_meta = strip_mila_metadata(mila_last)
-            if mila_meta:
-                meta_json = json.dumps(mila_meta, ensure_ascii=False)
-                logger.info(f"🏷️ Mila metadata (first message): {meta_json}")
-                print(f"🏷️ Mila metadata: {meta_json}")
 
             logger.info("✓ RECEIVED MILA'S FIRST MESSAGE")
             logger.info(f"  Length: {len(mila_last)} chars")
             logger.info(f"  Content: {mila_last[:200]}...")
+            # IMPORTANT: print the `🟠 Mila first message:` speaker marker
+            # BEFORE the `🏷️ Mila metadata:` debug line. format_conversation_page
+            # parses stdout by speaker markers: whoever most-recently owned a
+            # marker owns everything until the next marker. If 🏷️ prints first,
+            # the parser attributes it to the previous speaker (Tester),
+            # producing a cosmetic leak where Mila's self-reported metadata
+            # renders inside the Tester's bubble on the Notion transcript.
+            # Observed 2026-04-23 on run TR1.TC1.1.
             print(f"🟠 Mila first message:\n{mila_last}\n")
+            if mila_meta:
+                meta_json = json.dumps(mila_meta, ensure_ascii=False)
+                logger.info(f"🏷️ Mila metadata (first message): {meta_json}")
+                print(f"🏷️ Mila metadata: {meta_json}")
             CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
             
             # ✨ Capture first message state
@@ -1729,16 +1737,60 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                     display_reply = f"{tester_reply}\n\n---\n{score_badge}"
                     
                     # Check for early exit
+                    #
+                    # Two independent early-exit signals:
+                    #
+                    #   1. score >= 90 alone — the tester is confident coverage
+                    #      is near-complete; exit regardless of should_continue.
+                    #
+                    #   2. should_continue=False from the tester — per the
+                    #      tester prompt (Section 3.1) this means "main goals
+                    #      met, no meaningful new testing remaining". Trust
+                    #      that signal unconditionally.
+                    #
+                    # A previous version additionally required `score >= 80`
+                    # before honouring should_continue=False, which ignored
+                    # legitimate stop signals at moderate scores and dragged
+                    # conversations to MAX_TURNS with redundant turns that
+                    # then polluted `efficiency_and_flow` during evaluation.
+                    # We still want visibility when the tester stops at low
+                    # coverage (possible tester-bot misbehaviour), so we emit
+                    # an analytics warning — but we honour the stop.
                     if score >= 90:
                         logger.info(f"🎯 HIGH SCORE: {score}/100 >= 90")
                         early_exit = True
                         early_exit_reason = f"High score ({score}/100)"
-                    
-                    if not should_continue and score >= 80:
-                        logger.info(f"✅ COMPLETION: should_continue=false AND score={score}/100 >= 80")
+
+                    if not should_continue:
+                        logger.info(
+                            f"✅ COMPLETION: should_continue=false (score={score}/100)"
+                        )
                         early_exit = True
-                        early_exit_reason = f"Completion signal (score={score}/100)"
-                    
+                        early_exit_reason = f"Tester stop signal (score={score}/100)"
+                        if score is not None and score < 60:
+                            logger.warning(
+                                f"⚠️ Tester stopped at low coverage (score={score}/100) — "
+                                f"possible under-testing; emitting analytics warning"
+                            )
+                            print(
+                                f"⚠️ Tester stopped at low coverage (score={score}/100)"
+                            )
+                            try:
+                                _emit_analytics_event(
+                                    "tester_stopped_low_coverage",
+                                    execution_id=os.getenv("EXECUTION_ID", ""),
+                                    run_number=os.getenv("EXECUTION_RUN_NUMBER", ""),
+                                    test_case=TEST_CASE,
+                                    persona=TEST_PERSONA,
+                                    turn_number=turn,
+                                    max_turns=MAX_TURNS,
+                                    tester_completeness_score=score,
+                                )
+                            except Exception as _e:
+                                logger.warning(
+                                    f"analytics emit (tester_stopped_low_coverage) failed: {_e}"
+                                )
+
                     if early_exit:
                         logger.info(f"✨ EARLY EXIT: {early_exit_reason}")
                         print(f"\n✨ EARLY EXIT: {early_exit_reason}")
@@ -1844,15 +1896,22 @@ def run_bridge_single_attempt() -> Tuple[List[Dict[str, str]], int]:
                 # logged to stdout so format_conversation_page can render it
                 # as part of the Mila message in Notion.
                 mila_last, mila_meta = strip_mila_metadata(mila_last)
-                if mila_meta:
-                    meta_json = json.dumps(mila_meta, ensure_ascii=False)
-                    logger.info(f"🏷️ Mila metadata (Turn {turn}): {meta_json}")
-                    print(f"🏷️ Mila metadata: {meta_json}")
 
                 logger.info(f"✓ RECEIVED MILA'S REPLY (Turn {turn})")
                 logger.info(f"  Length: {len(mila_last)} chars")
                 logger.info(f"  Content: {mila_last[:200]}...")
+                # IMPORTANT: print the `🟠 Mila reply:` speaker marker BEFORE
+                # the `🏷️ Mila metadata:` debug line (see matching comment on
+                # the first-message path above). Without this ordering, the
+                # format_conversation_page parser attaches the metadata line
+                # to the previous speaker (Tester), rendering Mila's
+                # self-reported KPI block inside the wrong bubble on the
+                # Notion transcript.
                 print(f"🟠 Mila reply:\n{mila_last}\n")
+                if mila_meta:
+                    meta_json = json.dumps(mila_meta, ensure_ascii=False)
+                    logger.info(f"🏷️ Mila metadata (Turn {turn}): {meta_json}")
+                    print(f"🏷️ Mila metadata: {meta_json}")
                 CONVERSATION_LOG.append({"speaker": "Mila", "message": mila_last})
 
                 # ---- Analytics event: one row per completed turn ----

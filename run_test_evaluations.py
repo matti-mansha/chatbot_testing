@@ -1028,17 +1028,72 @@ def process_single_evaluation(execution: Dict[str, Any], test_exec_db_id: str, t
     print(f"   Persona: {persona}")
     print(f"   Test run: {test_run_number}")
 
+    # --- Guard: we need a conversation to evaluate --------------------------
+    #
+    # Previously, a missing or unparseable "Conversation flow" link caused
+    # this function to return False *before* marking the row as
+    # "Evaluation started". That left the row at "Test Executed" status,
+    # so the next poll loop (10 s later) would pick it up again, log the
+    # same warning, and skip again — forever. No `evaluation_completed`
+    # analytics event was ever emitted, so the execution silently
+    # disappeared from partner analytics.
+    #
+    # Now: on a missing/broken link we transition the row to a terminal
+    # state ("Evaluation completed" with no score + no evaluation page),
+    # emit a single `evaluation_completed` analytics event with the
+    # error reason filled in, and return True (processed — do not retry).
+    # If the conversation page exists but was uploaded late (rare Notion
+    # consistency lag), an operator can flip the status back to "Test
+    # Executed" manually to retry.
+    def _mark_unevaluatable(reason: str) -> bool:
+        logger.warning(f"   ⚠️ {reason} — marking execution terminal.")
+        print(f"   ⚠️ {reason} — marking execution terminal.")
+        try:
+            update_execution_row_after_evaluation(
+                execution_page_id=page_id,
+                execution_properties=execution.get("properties", {}) or {},
+                evaluation_json=None,
+                raw_json="",
+                error=reason,
+                evaluation_page_id=None,
+            )
+        except Exception as _e:
+            logger.error(
+                f"   ❌ Failed to mark row terminal after '{reason}': {_e}"
+            )
+        try:
+            _emit_analytics_event(
+                "evaluation_completed",
+                execution_id=page_id,
+                run_number=test_run_number,
+                test_case=test_case_name,
+                persona=persona,
+                overall_score=None,
+                overall_result=None,
+                overall_comment=None,
+                summary_of_goal="",
+                kpis={},
+                evaluation_page_id=None,
+                evaluation_page_url=None,
+                evaluator_duration_sec=0.0,
+                evaluator_error=reason,
+            )
+        except Exception as _e:
+            logger.warning(
+                f"   analytics emit (evaluation_completed, error={reason}) failed: {_e}"
+            )
+        # Returning True signals "processed — do not enqueue again".
+        return True
+
     conv_url = extract_rich_text_link(execution, "Conversation flow")
     if not conv_url:
-        logger.warning("   ⚠️ No Conversation flow link found; skipping.")
-        print("   ⚠️ No Conversation flow link found; skipping.")
-        return False
+        return _mark_unevaluatable("missing_conversation_flow_link")
 
     conv_page_id = extract_page_id_from_url(conv_url)
     if not conv_page_id:
-        logger.warning(f"   ⚠️ Could not parse page ID from conversation URL: {conv_url}")
-        print(f"   ⚠️ Could not parse page ID from conversation URL: {conv_url}")
-        return False
+        return _mark_unevaluatable(
+            f"unparseable_conversation_flow_url:{conv_url}"
+        )
 
     conversation_text = load_text_from_page_blocks(conv_page_id)
     logger.debug(f"   🧵 Conversation text length: {len(conversation_text)} chars")
