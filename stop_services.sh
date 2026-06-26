@@ -11,7 +11,6 @@
 #   4. prepare_test_runs.py
 #   5. run_test_evaluations.py
 #   6. test_bot_headless.py
-#   7. streamlit .* dashboard_app — the live dashboard, if running
 #
 # Always exits 0 — safe to call as a pre-step inside start_services.sh.
 
@@ -26,7 +25,6 @@ PATTERNS=(
     "prepare_test_runs.py"
     "run_test_evaluations.py"
     "test_bot_headless.py"
-    "streamlit.*dashboard_app"
 )
 
 echo "🛑 Stopping all services..."
@@ -53,7 +51,7 @@ fi
 
 # Final audit
 REMAINING=$(ps -eo pid,cmd --no-headers 2>/dev/null \
-    | grep -E "test_bot_headless|prepare_test_runs|run_test_executions|run_test_evaluations|playwright_bridge_bot_headless|chrome-headless-shell|streamlit.*dashboard_app" \
+    | grep -E "test_bot_headless|prepare_test_runs|run_test_executions|run_test_evaluations|playwright_bridge_bot_headless|chrome-headless-shell" \
     | grep -v grep || true)
 
 if [ -z "$REMAINING" ]; then

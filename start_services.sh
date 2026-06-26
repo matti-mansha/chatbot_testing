@@ -7,17 +7,15 @@
 #   3. prepare_test_runs.py       (copies Notion test-run templates → executions)
 #   4. run_test_executions.py     (picks pending executions, spawns the bridge)
 #   5. run_test_evaluations.py    (OpenAI-scores completed conversations)
-#   6. dashboard_app.py           (live Streamlit dashboard on 127.0.0.1:8502)
 #
 # Also runs stop_services.sh first to guarantee a clean slate — no orphan
 # bridge / chromium processes can survive a restart.
 #
 # Flags:
-#   START_DASHBOARD=0   skip the dashboard (default: 1, i.e. start it)
 #   SKIP_RETENTION=1    skip the log-retention sweep (default: run it)
-#   DASHBOARD_PORT=N    override the dashboard port (default: 8502)
-#   DASHBOARD_HOST=H    override the dashboard bind address (default: 127.0.0.1,
-#                       i.e. localhost only — SSH-tunnel from your laptop)
+#
+# NOTE: the Streamlit dashboard was retired (redundant — KPIs are delivered as
+# JSON to the analytics vendor, not via a UI). Archived in archive/dashboard_app.py.
 
 set -euo pipefail
 
@@ -25,12 +23,8 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
 PYTHON="$DIR/env/bin/python"
-STREAMLIT="$DIR/env/bin/streamlit"
 
-START_DASHBOARD="${START_DASHBOARD:-1}"
 SKIP_RETENTION="${SKIP_RETENTION:-0}"
-DASHBOARD_PORT="${DASHBOARD_PORT:-8502}"
-DASHBOARD_HOST="${DASHBOARD_HOST:-127.0.0.1}"
 
 if [ ! -f "$PYTHON" ]; then
     echo "❌ Virtual environment Python not found at: $PYTHON"
@@ -78,21 +72,6 @@ sleep 3
 start_service "run_test_executions.py"  run_test_executions.py  execute.log
 start_service "run_test_evaluations.py" run_test_evaluations.py evaluate.log
 
-# --- Step 6: dashboard --------------------------------------------------------
-if [ "$START_DASHBOARD" = "1" ] && [ -x "$STREAMLIT" ] && [ -f "$DIR/dashboard_app.py" ]; then
-    echo "   ▶️  Starting dashboard_app.py (Streamlit on $DASHBOARD_HOST:$DASHBOARD_PORT)..."
-    nohup "$STREAMLIT" run dashboard_app.py \
-        --server.address="$DASHBOARD_HOST" \
-        --server.port="$DASHBOARD_PORT" \
-        --server.headless=true \
-        --browser.gatherUsageStats=false \
-        --theme.base=dark \
-        > logs/dashboard.log 2>&1 &
-    disown
-elif [ "$START_DASHBOARD" = "1" ]; then
-    echo "   ⚠️  Dashboard skipped: streamlit not found at $STREAMLIT or dashboard_app.py missing"
-fi
-
 # Wait for processes to come up
 sleep 3
 
@@ -100,7 +79,7 @@ sleep 3
 echo ""
 echo "✅ Services started! Running processes:"
 ps -eo pid,etime,cmd --no-headers \
-    | grep -E "test_bot_headless|prepare_test_runs|run_test_executions|run_test_evaluations|streamlit.*dashboard_app" \
+    | grep -E "test_bot_headless|prepare_test_runs|run_test_executions|run_test_evaluations" \
     | grep -v grep \
     | awk '{printf "   %5s  up %-10s %s\n", $1, $2, substr($0, index($0,$3), 80)}'
 
@@ -109,21 +88,9 @@ echo "📊 Monitor:"
 echo "   ./testbot status               # quick CLI snapshot"
 echo "   ./testbot tail execute         # tail a service log"
 echo "   ./testbot errors               # today's errors"
-if [ "$START_DASHBOARD" = "1" ] && [ -x "$STREAMLIT" ]; then
-    echo ""
-    echo "🌐 Dashboard (direct):  http://$DASHBOARD_HOST:$DASHBOARD_PORT/"
-    if [ "$DASHBOARD_HOST" = "127.0.0.1" ]; then
-        echo "   SSH tunnel from your laptop:"
-        echo "     ssh -i Matti-aupair.pem -L $DASHBOARD_PORT:localhost:$DASHBOARD_PORT ubuntu@<host>"
-        echo "   Then open http://localhost:$DASHBOARD_PORT/"
-    fi
-
-    # If nginx reverse proxy is installed, show the public URL too
-    if [ -L /etc/nginx/sites-enabled/mila-dashboard ] && systemctl is-active --quiet nginx 2>/dev/null; then
-        PUBLIC_IP=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "<ec2-public-ip>")
-        echo ""
-        echo "🔒 Dashboard (public via nginx): ${PUBLIC_IP:+https://$PUBLIC_IP/}"
-        echo "   Credentials: /etc/nginx/htpasswd-mila"
-        echo "   Manage: ./testbot nginx-status | ./testbot nginx-install | ./testbot nginx-remove"
-    fi
+echo ""
+echo "📥 Analytics for the vendor: logs/analytics/events_YYYYMMDD.jsonl"
+if [ -L /etc/nginx/sites-enabled/mila-dashboard ] && systemctl is-active --quiet nginx 2>/dev/null; then
+    PUBLIC_IP=$(curl -s --max-time 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "<ec2-public-ip>")
+    echo "   Download (via nginx): ${PUBLIC_IP:+https://$PUBLIC_IP/analytics/}"
 fi

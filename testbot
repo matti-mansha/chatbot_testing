@@ -10,7 +10,6 @@
 #     ./testbot stop                # stop all services (wraps stop_services.sh)
 #     ./testbot start               # start all services (wraps start_services.sh)
 #     ./testbot restart             # stop + start
-#     ./testbot dashboard           # launch the Streamlit dashboard on :8502
 #     ./testbot retention [--dry]   # run the log retention sweep
 #     ./testbot disk                # show disk usage for logs/ and diagnostics/
 #     ./testbot nginx-install [opts]   # install nginx reverse proxy on :443 (sudo)
@@ -31,7 +30,6 @@ DATE="$(date +%Y%m%d)"
 LOG_DIR="$BASE_DIR/logs"
 DIAG_DIR="$BASE_DIR/diagnostics"
 VENV_PY="$BASE_DIR/env/bin/python"
-VENV_STREAMLIT="$BASE_DIR/env/bin/streamlit"
 
 # ---- colors (respect NO_COLOR) ----
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -218,21 +216,6 @@ cmd_restart() {
     cmd_start
 }
 
-cmd_dashboard() {
-    if [[ ! -x "$VENV_STREAMLIT" ]]; then
-        echo "error: $VENV_STREAMLIT not found (venv missing?)" >&2
-        return 1
-    fi
-    echo "${C_BOLD}${C_CYAN}Launching dashboard on http://127.0.0.1:8502 ...${C_RESET}"
-    echo "${C_DIM}(SSH tunnel: ssh -L 8502:localhost:8502 ubuntu@<host>)${C_RESET}"
-    "$VENV_STREAMLIT" run dashboard_app.py \
-        --server.address=127.0.0.1 \
-        --server.port=8502 \
-        --server.headless=true \
-        --browser.gatherUsageStats=false \
-        --theme.base=dark
-}
-
 cmd_retention() {
     if [[ ! -x "$VENV_PY" ]]; then
         echo "error: $VENV_PY not found (venv missing?)" >&2
@@ -356,7 +339,6 @@ main() {
         stop)          cmd_stop ;;
         start)         cmd_start ;;
         restart)       cmd_restart ;;
-        dashboard|dash)    cmd_dashboard ;;
         retention)     cmd_retention "$@" ;;
         disk)          cmd_disk ;;
         nginx-install|nginx_install)  cmd_nginx_install "$@" ;;
