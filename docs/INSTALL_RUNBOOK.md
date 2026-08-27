@@ -365,3 +365,61 @@ if reused anywhere else.
 
 Previously ~$17/month (t2.small) plus ~$3.60 EIP. Now ~$1.25/month for snapshot
 storage alone.
+
+---
+
+## Step 6 — Deploy to a new host
+
+**Host:** `i-06ea8478ce16a7714` · `52.29.135.98` · eu-central-1b · t3.small · 30 GB gp3
+**AMI:** `ami-04bc554a9635a77c8` (Ubuntu 24.04 LTS)
+**Security group:** `sg-069e523088870f8b1` — SSH (22) only
+
+Port **8501 is deliberately not exposed**: the tester API binds `0.0.0.0` with no
+authentication, so anything able to reach it can spend the OpenAI budget.
+
+### Prerequisite — publish the fixes
+
+The fixes from Steps 2–3b existed only locally. Cloning the public repo would have
+delivered the old code and reproduced the silent stall. Pushed as `5055633` before
+provisioning; the deployed host is verified to be running that commit.
+
+Client-confidential documents (`CLIENT_HANDOVER.*`, `HANDOVER_PLAN.docx`) were
+deliberately **excluded** from the push — the repository is public.
+
+### Method
+
+Bootstrapped entirely through **EC2 user-data**; the host configures itself on
+first boot. SSM was not available (IAM role creation was blocked), and user-data
+needs no inbound access at all.
+
+`.env` is **not** written by user-data. Instance metadata is readable from the host
+and via `ec2:DescribeInstanceAttribute`, so secrets must not travel that way. It is
+copied over SSH afterwards.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Bootstrap marker | `bootstrap_completed=2026-08-27T06:42:34Z` |
+| Deployed commit | `5055633` |
+| Python | 3.12.3 |
+| Dependencies | httpx 0.28.1, pydantic 2.13.4, openai 1.109.1, playwright 1.62.0, notion-client 2.7.0 |
+| Chromium | 151.0.7922.34 — launches headless |
+| Bridge self-test | 13/13 pass |
+| preflight.py | all green (1 advisory warning) |
+| Notion API | `POST /v1/databases/.../query → 200` |
+| Services | 4/4 alive |
+| Errors today | none |
+| Log retention cron | installed at `/etc/cron.d/chatbot-log-retention` |
+
+### Config corrections applied
+
+- `EVALUATION_PAGE_LINK_PROPERTY` blanked — no such property exists in the
+  AuPairWorld schema, so back-linking is skipped explicitly rather than by accident.
+- Removed the dead variables `NOTION_PARENT_PAGE_ID`, `TEST_BOT_URL`,
+  `CHECK_INTERVAL` (read only by `archive/`). 37 vars → 34.
+
+### Status
+
+Idle and healthy, awaiting a Test Run. `docs/DEPLOYMENT_GUIDE.md` contains the full
+copy-paste command set and the Notion operator guide.

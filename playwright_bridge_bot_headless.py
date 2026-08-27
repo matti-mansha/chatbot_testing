@@ -311,8 +311,26 @@ SELECTORS = {
         # Legacy header selector (kept for backward compatibility)
         "header": "div.chat-header",
         # Reset/clear chat
-        "reset_chat": "div.reset-chat",
-        "clear_history": "div.reset-chat, a.clear-history, a[class*='clear-history'], a.chat-dropdown-link",
+        # The reset control is an ICON ONLY - a <span class="icon"> wrapping an
+        # SVG with aria-hidden="true" and no text. So text matching and the older
+        # div/anchor selectors below can never match it; they are kept purely as
+        # fallbacks for other MILA builds.
+        #
+        # The SVG path geometry is the only stable distinguishing feature. The
+        # clip-path id (e.g. clip0_4712_20613) is build-generated and WILL drift,
+        # so it must not be used. If the icon artwork is ever redrawn, update the
+        # `d^=` prefix below - read it from the live DOM, do not guess.
+        "reset_chat": (
+            "span.icon:has(path[d^='M9.22695 2.39614']), "
+            "[aria-label*='Reset' i], [title*='Reset' i], "
+            "div.reset-chat"
+        ),
+        "clear_history": (
+            "span.icon:has(path[d^='M9.22695 2.39614']), "
+            "[aria-label*='Reset' i], [aria-label*='Clear' i], "
+            "[title*='Reset' i], [title*='Clear' i], "
+            "div.reset-chat, a.clear-history, a[class*='clear-history'], a.chat-dropdown-link"
+        ),
         # Menu (kebab icon in header)
         "menu_opener": "qz-dropdown qz-icon[slot='opener']",
     }
@@ -1455,7 +1473,9 @@ def clear_mila_history(page: Page):
                 if clear_btn.is_visible(timeout=2000):
                     logger.info(f"✓ Found Reset/Clear button: {clear_sel}")
                     print(f"   Found Reset/Clear with selector: {clear_sel}")
-                    clear_btn.click()
+                    # Same widget, same actionability caveat as the chat input.
+                    if not robust_click(clear_btn, "reset chat button"):
+                        raise Exception("reset button click failed")
                     logger.info("✓ Clicked 'Reset chat'")
                     print("   ✓ Clicked 'Reset chat'")
                     page.wait_for_timeout(1500)
