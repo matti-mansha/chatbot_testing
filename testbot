@@ -181,7 +181,25 @@ cmd_errors() {
         echo "${C_DIM}(no log files for today)${C_RESET}"
         return 0
     fi
-    grep -E "ERROR|Traceback|🚨|CRITICAL|FATAL" "${files[@]}" 2>/dev/null | tail -30 || echo "${C_GREEN}(none found)${C_RESET}"
+    # Match the LEVEL COLUMN, not the whole line.
+    #
+    # Log format:  <ts> | <service> |    ERROR | <file>:<line> | <message>
+    #
+    # A bare "ERROR|CRITICAL|FATAL" match anywhere in the line is useless here:
+    # the tester-bot prompt echoed on the "Arguments:" line contains the word
+    # CRITICAL, so every run dumped ~10 KB of prompt text and buried the real
+    # errors. Anchoring to the level field fixes that.
+    #
+    # Long messages are truncated so one huge line cannot flood the view; use
+    # ./testbot tail <service> to read a full entry.
+    local out
+    out=$(grep -hE "\|[[:space:]]*(ERROR|CRITICAL|FATAL)[[:space:]]*\||Traceback \(most recent call last\)|🚨" \
+              "${files[@]}" 2>/dev/null | cut -c1-240 | tail -30)
+    if [[ -z "$out" ]]; then
+        echo "${C_GREEN}(none found)${C_RESET}"
+    else
+        echo "$out"
+    fi
 }
 
 cmd_kill_bridge() {
