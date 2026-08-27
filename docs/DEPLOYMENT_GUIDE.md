@@ -199,6 +199,74 @@ Without this, logs grow without bound.
 
 ---
 
+## 9b. Start automatically on boot (recommended)
+
+`start_services.sh` does **not** survive a reboot — after any restart of the host
+the pipeline stays down until someone runs it manually. Install the systemd units
+instead:
+
+```bash
+cd ~/chatbot_testing && sudo ./scripts/install_systemd.sh
+```
+
+That creates one unit per service, grouped under `mila-pipeline.target`:
+
+| Unit | Service |
+|---|---|
+| `mila-testbot.service` | tester-bot API (`127.0.0.1:8501`) |
+| `mila-prepare.service` | watches Notion for triggered runs |
+| `mila-execute.service` | runs pending executions via the Playwright bridge |
+| `mila-evaluate.service` | scores completed conversations |
+| `mila-retention.timer` | nightly log sweep at 03:00 (replaces the cron entry) |
+
+Everything is enabled at install time, so the pipeline comes up on every boot.
+
+### Managing it
+
+```bash
+sudo systemctl restart mila-pipeline.target
+```
+
+```bash
+sudo systemctl stop mila-pipeline.target
+```
+
+```bash
+systemctl status mila-execute
+```
+
+```bash
+journalctl -u mila-execute -f
+```
+
+`./testbot status`, `./testbot tail` and `./testbot errors` all keep working — each
+unit appends to the same `logs/*.log` files the shell script used.
+
+> **After installing, stop using `./start_services.sh`.** systemd is managing the
+> services; running the script as well would start a second copy of each one.
+> Use `sudo systemctl restart mila-pipeline.target` instead.
+
+A useful side effect: systemd tracks each service's whole process group, so
+stopping a unit also reaps the Playwright bridge and any headless Chromium it
+spawned — the orphan-process problem `./testbot kill-bridge` exists to clean up.
+
+### Verifying it survives a reboot
+
+```bash
+sudo reboot
+```
+
+Then reconnect and check:
+
+```bash
+cd ~/chatbot_testing && systemctl --plain list-units 'mila-*' && ./testbot status
+```
+
+All four services should be `active (running)` with no manual step.
+
+
+---
+
 # Operator Guide — running a test from Notion
 
 No terminal access is required for day-to-day use.
