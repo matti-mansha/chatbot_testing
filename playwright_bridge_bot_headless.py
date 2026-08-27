@@ -993,6 +993,56 @@ def dismiss_page_notices(page: Page) -> int:
         return 0
 
 
+def robust_click(locator, label: str, timeout_ms: int = 5000) -> bool:
+    """
+    Click an element, falling back to a DOM click when Playwright's actionability
+    check cannot be satisfied. Returns True if either path succeeded.
+
+    Why this is needed: MILA's chat widget is a `deep-chat` web component whose
+    contents live in a shadow root, and whose ancestors (`div.sticky-chat-container`,
+    `div.box-inner`) compute to zero height. The widget paints correctly, but
+    Playwright's "stable" requirement is never met against that layout, so a plain
+    .click() spins for its full timeout and fails - even though the element is
+    visible, enabled and unobstructed.
+
+    locator.evaluate() receives the already-resolved element handle, so it reaches
+    into the shadow root correctly. Note that document.querySelector() does NOT -
+    it cannot pierce shadow boundaries.
+    """
+    try:
+        locator.click(timeout=timeout_ms)
+        return True
+    except Exception as e:
+        logger.warning(
+            f"  ⚠️ Direct click on {label} failed ({type(e).__name__}) — using DOM click"
+        )
+    try:
+        locator.evaluate("(el) => el.click()")
+        logger.debug(f"  DOM click on {label} succeeded")
+        return True
+    except Exception as e:
+        logger.error(f"  ❌ DOM click on {label} also failed: {e}")
+        return False
+
+
+def robust_focus(locator, label: str, timeout_ms: int = 5000) -> bool:
+    """Focus an element; same shadow-DOM / stability caveats as robust_click()."""
+    try:
+        locator.click(timeout=timeout_ms)
+        return True
+    except Exception as e:
+        logger.warning(
+            f"  ⚠️ Could not click {label} to focus ({type(e).__name__}) — using DOM focus"
+        )
+    try:
+        locator.evaluate("(el) => el.focus()")
+        logger.debug(f"  DOM focus on {label} succeeded")
+        return True
+    except Exception as e:
+        logger.error(f"  ❌ DOM focus on {label} also failed: {e}")
+        return False
+
+
 # Phrases Drupal uses when it actually rejects an authentication attempt.
 # Matched case-insensitively against the text of error notices.
 #
@@ -1609,7 +1659,10 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
             
             box.wait_for(state="visible", timeout=30000)
             logger.debug("  Input field visible")
-            box.click()
+            # Focus only — the actual text is written via JavaScript below.
+            # A plain .click() here hangs for its full timeout against the
+            # deep-chat shadow DOM (see robust_focus).
+            robust_focus(box, "chat input")
             page.wait_for_timeout(300)
             
             # Fill input
@@ -1649,12 +1702,13 @@ def send_message_to_mila(page: Page, text: str, max_retries: int = 3):
             try:
                 btn.wait_for(state="visible", timeout=5000)
                 logger.debug("  Send button visible, clicking")
-                btn.click()
+                if not robust_click(btn, "send button"):
+                    raise PlaywrightTimeoutError("send button click failed")
             except PlaywrightTimeoutError:
-                logger.warning("  Send button not visible, trying Enter key")
+                logger.warning("  Send button not clickable, trying Enter key")
                 try:
                     # Focus the input first, then press Enter
-                    box.click()
+                    robust_focus(box, "chat input")
                     page.wait_for_timeout(200)
                     page.keyboard.press("Enter")
                     logger.debug("  Enter key pressed")
