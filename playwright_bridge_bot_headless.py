@@ -933,6 +933,148 @@ def dismiss_cookie_banner(page: Page):
     print("ℹ️ Cookie banner not found or already dismissed.")
 
 
+# Drupal renders status/error notices as a custom <qz-message> element, and
+# also via the classic Drupal markup. With lifespan="0" they never auto-dismiss,
+# so they persist for the rest of the session.
+PAGE_NOTICE_SELECTOR = (
+    "qz-message, [data-drupal-message-type], .messages--error, .messages--status"
+)
+PAGE_ERROR_SELECTOR = (
+    "qz-message[status='error'], "
+    "[data-drupal-message-type='error'], "
+    ".messages--error"
+)
+
+
+def collect_page_error_notices(page: Page) -> list:
+    """
+    Return the visible text of any Drupal *error* notices on the page.
+
+    Used to turn an opaque failure (a click that times out 30s later because
+    something invisible is in the way) into a precise, actionable message.
+    """
+    try:
+        return page.evaluate(
+            """(sel) => Array.from(document.querySelectorAll(sel))
+                 .map(e => (e.innerText || e.textContent || '').trim())
+                 .filter(t => t.length > 0)""",
+            PAGE_ERROR_SELECTOR,
+        ) or []
+    except Exception as e:
+        logger.debug(f"  collect_page_error_notices failed: {e}")
+        return []
+
+
+def dismiss_page_notices(page: Page) -> int:
+    """
+    Remove Drupal notice banners from the DOM.
+
+    These are rendered with lifespan="0" (never auto-dismiss) and are laid out
+    over the page content. Playwright correctly refuses to click anything they
+    cover, reporting only "<qz-message ...> intercepts pointer events" after a
+    30s timeout — which looks like a broken selector but is not.
+
+    Returns the number of elements removed.
+    """
+    try:
+        removed = page.evaluate(
+            """(sel) => {
+                const els = Array.from(document.querySelectorAll(sel));
+                els.forEach(e => e.remove());
+                return els.length;
+            }""",
+            PAGE_NOTICE_SELECTOR,
+        ) or 0
+        if removed:
+            logger.info(f"🧹 Removed {removed} page notice banner(s) blocking the UI")
+        return removed
+    except Exception as e:
+        logger.debug(f"  dismiss_page_notices failed: {e}")
+        return 0
+
+
+# Phrases Drupal uses when it actually rejects an authentication attempt.
+# Matched case-insensitively against the text of error notices.
+#
+# Deliberately narrow: the site also renders unrelated error notices on pages
+# where login SUCCEEDED (observed 2026-08-24 — a successful login carrying an
+# unrelated qz-message error banner). Treating any error notice as an auth
+# failure would abort perfectly good runs.
+AUTH_FAILURE_PHRASES = (
+    "unrecognized username or password",
+    # Drupal flood control renders this as:
+    #   "There have been more than 5 failed login attempts for this account.
+    #    It is temporarily blocked. Try again later or request a new password."
+    # The count varies with configuration, so match the invariant part.
+    "failed login attempts",
+    "has not been activated",
+    "is blocked",
+    "temporarily blocked",
+    "password field is empty",
+)
+
+
+def verify_mila_login(page: Page) -> None:
+    """
+    Confirm the login actually succeeded. Raises RuntimeError only when the
+    failure is unambiguous.
+
+    Without this check the bridge logs "✓ Login attempt complete" no matter what
+    happened, and a bad credential only surfaces ~30 seconds later as a chat
+    widget timeout — pointing the investigation at the wrong component entirely.
+
+    Signals, in order of authority:
+      1. An error notice whose text matches a known authentication rejection
+         -> definite failure.
+      2. Still sitting on /user/login after submitting -> definite failure
+         (a successful Drupal login redirects away, HTTP 303).
+      3. Any other error notice -> logged as a WARNING, not fatal. The site
+         renders unrelated errors on perfectly good sessions, and those banners
+         are handled separately by dismiss_page_notices().
+    """
+    errors = collect_page_error_notices(page)
+    still_on_login = "/user/login" in (page.url or "")
+
+    auth_errors = [
+        e for e in errors
+        if any(p in e.lower() for p in AUTH_FAILURE_PHRASES)
+    ]
+
+    if auth_errors:
+        detail = " | ".join(auth_errors)[:500]
+        logger.error("=" * 60)
+        logger.error("❌ LOGIN FAILED — the site rejected the credentials")
+        logger.error(f"   User: {MILA_LOGIN_USER}")
+        logger.error(f"   Site said: {detail}")
+        logger.error("=" * 60)
+        print(f"❌ LOGIN FAILED for {MILA_LOGIN_USER}: {detail}")
+        raise RuntimeError(f"Mila login failed: {detail}")
+
+    if still_on_login:
+        logger.error("=" * 60)
+        logger.error("❌ LOGIN FAILED — still on the login page after submitting")
+        logger.error(f"   User: {MILA_LOGIN_USER}")
+        logger.error(f"   URL:  {page.url}")
+        if errors:
+            logger.error(f"   Page errors: {' | '.join(errors)[:300]}")
+        logger.error("=" * 60)
+        print(f"❌ LOGIN FAILED for {MILA_LOGIN_USER} — still on {page.url}")
+        raise RuntimeError(
+            f"Mila login failed: still on the login page ({page.url}). "
+            "Check MILA_LOGIN_USER / MILA_LOGIN_PASS."
+        )
+
+    if errors:
+        # Login worked, but the page is carrying an error banner. Record it —
+        # it is almost certainly what will block the chat widget next.
+        logger.warning(
+            f"⚠️ Login OK, but the page shows {len(errors)} error notice(s) "
+            f"unrelated to authentication: {' | '.join(errors)[:300]}"
+        )
+
+    logger.info(f"✓ Login verified — session established as {MILA_LOGIN_USER}")
+
+
 def perform_mila_login(page: Page):
     """Perform Mila login"""
     logger.info("=" * 60)
@@ -998,14 +1140,28 @@ def perform_mila_login(page: Page):
         except Exception:
             logger.debug("  Network idle timeout, continuing...")
         page.wait_for_timeout(2000)
-        logger.info("✓ Login attempt complete")
+        logger.info("✓ Login form submitted")
+
+        # Verify the login actually succeeded before anything downstream relies
+        # on having a session. Raises RuntimeError with the site's own error text.
+        verify_mila_login(page)
+
         logger.info("=" * 60)
-        print("🔓 Login attempt complete.")
-        
+        print("🔓 Login complete and verified.")
+
+    except RuntimeError:
+        # Raised by verify_mila_login for a genuine authentication failure.
+        # This must propagate — logging and continuing is what caused the failure
+        # to resurface later as an unrelated chat-widget timeout.
+        logger.info("=" * 60)
+        raise
     except PlaywrightTimeoutError:
+        # No login form on the page. Usually means an existing session, but it
+        # can also mean the page failed to render — so still verify.
         logger.info("ℹ️ Login form did not appear (maybe already logged in)")
-        logger.info("=" * 60)
         print("ℹ️ Login form did not appear (maybe already logged in?).")
+        verify_mila_login(page)
+        logger.info("=" * 60)
     except Exception as e:
         log_exception(logger, e, "perform_mila_login")
         logger.error("=" * 60)
@@ -1100,7 +1256,28 @@ def open_mila_chat(page: Page):
         # Click the FAB button. Current MILA UI uses <button class="fab-mode">;
         # the selector also matches the older <div class="fab-mode"> for
         # backward compatibility.
+        # Drupal notice banners (qz-message, lifespan="0") are laid out over the
+        # page content and silently absorb clicks aimed at the FAB. Clear them
+        # first — otherwise Playwright retries for the full timeout and reports
+        # only "<qz-message ...> intercepts pointer events", which reads like a
+        # broken selector when the selector is in fact correct.
+        dismiss_page_notices(page)
+
         fab = page.locator(SELECTORS["mila"]["fab_button"]).first
+
+        def js_click_fab() -> bool:
+            """Click the FAB directly in the page. Ignores pointer-event
+            interception entirely, since it does not simulate a real mouse."""
+            return bool(
+                page.evaluate(
+                    """() => {
+                        const b = document.querySelector('button.fab-mode, div.fab-mode');
+                        if (b) { b.click(); return true; }
+                        return false;
+                    }"""
+                )
+            )
+
         try:
             fab.wait_for(state="visible", timeout=10000)
         except Exception:
@@ -1108,18 +1285,25 @@ def open_mila_chat(page: Page):
             # attached to the DOM either way, and in some transitional states
             # Playwright's visibility check is too strict.
             logger.warning("⚠️ FAB button not 'visible' to Playwright — using JS click fallback")
-            clicked = page.evaluate(
-                """() => {
-                    const b = document.querySelector('button.fab-mode, div.fab-mode');
-                    if (b) { b.click(); return true; }
-                    return false;
-                }"""
-            )
-            if not clicked:
+            if not js_click_fab():
                 logger.error("❌ FAB button not found in DOM — cannot open chat")
                 raise RuntimeError("Mila FAB button not found in DOM")
         else:
-            fab.click()
+            try:
+                # Deliberately short: a genuine click lands immediately. If
+                # something is still covering the button we want to fail fast
+                # and fall back, not spend the default 30s retrying.
+                fab.click(timeout=5000)
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Direct FAB click failed ({type(e).__name__}) — an overlay is "
+                    "likely intercepting pointer events; retrying via JS click"
+                )
+                # A notice may have appeared after the first sweep.
+                dismiss_page_notices(page)
+                if not js_click_fab():
+                    logger.error("❌ FAB button not found in DOM — cannot open chat")
+                    raise RuntimeError("Mila FAB button not found in DOM")
 
         page.wait_for_timeout(300)
 

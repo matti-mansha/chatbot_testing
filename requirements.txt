@@ -1,4 +1,44 @@
-notion-client
-openai
-python-dotenv
-playwright
+# MILA Chatbot Testing Framework — Python dependencies
+#
+# Install:  ./env/bin/pip install -r requirements.txt
+#           ./env/bin/playwright install chromium
+#           ./env/bin/playwright install-deps
+#
+# ------------------------------------------------------------------------------
+# NOTE ON PINNING
+# ------------------------------------------------------------------------------
+# The bounds below prevent the breaking-major-version class of failure, but they
+# are NOT an exact reproduction of the known-good Setaro environment.
+#
+# BEFORE CLIENT CUTOVER, capture the exact working versions from the live box:
+#
+#     ./env/bin/pip freeze > requirements.lock.txt
+#
+# and install the client from that lock file instead. `openai` and `playwright`
+# in particular change behaviour across minor releases.
+# ------------------------------------------------------------------------------
+
+# Notion API client — the control plane and datastore
+notion-client>=2.0,<3.0
+
+# OpenAI SDK — drives BOTH the tester bot and the evaluator.
+# Code uses the v1+ client style (`from openai import OpenAI`); do NOT drop to 0.x.
+openai>=1.0,<2.0
+
+# .env loading
+python-dotenv>=1.0,<2.0
+
+# Browser automation for the MILA bridge.
+# The Chromium build is version-coupled to this package — after ANY upgrade you
+# must re-run `playwright install chromium`.
+playwright>=1.40,<2.0
+
+# HTTP client — direct top-level import in prepare_test_runs, run_test_executions,
+# run_test_evaluations, format_conversation_page, playwright_bridge_bot_headless.
+# Previously satisfied only transitively via openai/notion-client. Declared
+# explicitly so a change in their dependency tree cannot break the pipeline.
+httpx>=0.27,<1.0
+
+# Structured evaluation schema in run_test_evaluations.py.
+# Also previously transitive-only via openai.
+pydantic>=2.0,<3.0

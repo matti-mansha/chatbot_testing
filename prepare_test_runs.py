@@ -515,7 +515,22 @@ def create_test_case_execution(
                     "name": status_value
                 }
             }
-        
+
+        # Test Execution Status must be set EXPLICITLY — do not rely on Notion's
+        # column default.
+        #
+        # run_test_executions.py filters for `Test Execution Status = "Not started"`.
+        # A duplicated or migrated workspace can lose the column's default value, in
+        # which case rows are created with a null status and the executor's filter can
+        # never match them. The pipeline then polls forever, logs
+        # "Found 0 pending executions", raises no error, and silently does nothing.
+        # Observed on the AuPairWorld handover workspace, 2026-08-24.
+        properties["Test Execution Status"] = {
+            "status": {
+                "name": "Not started"
+            }
+        }
+
         # Create page using HTTP POST
         start_time = time.time()
         response = httpx.post(
